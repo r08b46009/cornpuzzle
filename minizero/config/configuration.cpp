@@ -2,6 +2,9 @@
 #include <string>
 
 namespace minizero::config {
+std::string env_compound_piece_library = "";
+std::string env_compound_puzzles_dir = "";
+bool env_compound_random_select_puzzle = false;
 
 // program parameters
 int program_seed = 0;
@@ -193,6 +196,19 @@ void setConfiguration(ConfigureLoader& cl)
 #elif TETRISBLOCKPUZZLE
     cl.addParameter("env_tetris_block_puzzle_num_holding_block", env_tetris_block_puzzle_num_holding_block, "number of holding block", "Environment");
     cl.addParameter("env_tetris_block_puzzle_num_preview_holding_block", env_tetris_block_puzzle_num_preview_holding_block, "number of preview holding block", "Environment");
+#elif CORNPUZZLE
+    cl.addParameter("env_compound_piece_library",
+                    env_compound_piece_library,
+                    "fixed piece library file for Compound/CornPuzzle",
+                    "Environment");
+    cl.addParameter("env_compound_puzzles_dir",
+                    env_compound_puzzles_dir,
+                    "directory containing Compound puzzle txt files",
+                    "Environment");
+    cl.addParameter("env_compound_random_select_puzzle",
+                    env_compound_random_select_puzzle,
+                    "true for randomly selecting a Compound puzzle at reset",
+                    "Environment");
 #endif
 
     // references

@@ -227,8 +227,11 @@ def train(model, training_dir, data_loader, start_iter, end_iter):
 
     model.save_model(training_dir)
     print("Optimization_Done", model.training_step, flush=True)
-    eprint("Optimization_Done", model.training_step)
-    analysis(training_dir, "analysis")
+    print("Optimization_Done", model.training_step)
+    try:
+        analysis(training_dir, "analysis")
+    except Exception as e:
+        eprint(f"analysis failed: {e}")
 
 
 if __name__ == '__main__':

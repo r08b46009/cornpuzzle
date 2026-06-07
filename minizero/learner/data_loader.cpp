@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <fstream>
 #include <utility>
-
+#include <iostream>
 namespace minizero::learner {
 
 using namespace minizero;
@@ -24,7 +24,17 @@ ReplayBuffer::ReplayBuffer()
 void ReplayBuffer::addData(const EnvironmentLoader& env_loader)
 {
     std::pair<int, int> data_range = env_loader.getDataRange();
+
+    // std::cerr << "[ReplayBuffer] before deque: data_range=(" << data_range.first
+    //         << "," << data_range.second << ")"
+    //         << ", actions=" << env_loader.getActionPairs().size()
+    //         << std::endl;
+
     std::deque<float> position_priorities(data_range.second + 1, 0.0f);
+
+    // std::cerr << "[ReplayBuffer] after deque: position_priorities.size="
+    //         << position_priorities.size()
+    //         << std::endl;
     float game_priority = 0.0f;
     for (int i = data_range.first; i <= data_range.second; ++i) {
         position_priorities[i] = std::pow((config::learner_use_per ? env_loader.getPriority(i) : 1.0f), config::learner_per_alpha);
@@ -141,9 +151,17 @@ void DataLoaderThread::setAlphaZeroTrainingData(int batch_index)
     const EnvironmentLoader& env_loader = getSharedData()->replay_buffer_.env_loaders_[env_id];
     Rotation rotation = static_cast<Rotation>(Random::randInt() % static_cast<int>(Rotation::kRotateSize));
     float loss_scale = getSharedData()->replay_buffer_.getLossScale(p);
+    // std::cerr << "[DataLoader] before getFeatures pos=" << pos << std::endl;
     std::vector<float> features = env_loader.getFeatures(pos, rotation);
+    // std::cerr << "[DataLoader] after getFeatures size=" << features.size() << std::endl;
+
+    // std::cerr << "[DataLoader] before getPolicy pos=" << pos << std::endl;
     std::vector<float> policy = env_loader.getPolicy(pos, rotation);
+    // std::cerr << "[DataLoader] after getPolicy size=" << policy.size() << std::endl;
+
+    // std::cerr << "[DataLoader] before getValue pos=" << pos << std::endl;
     std::vector<float> value = env_loader.getValue(pos);
+    // std::cerr << "[DataLoader] after getValue size=" << value.size() << std::endl;
 
     // write data to data_ptr
     getSharedData()->getDataPtr()->loss_scale_[batch_index] = loss_scale;
@@ -164,7 +182,10 @@ void DataLoaderThread::setMuZeroTrainingData(int batch_index)
     const EnvironmentLoader& env_loader = getSharedData()->replay_buffer_.env_loaders_[env_id];
     Rotation rotation = static_cast<Rotation>(Random::randInt() % static_cast<int>(Rotation::kRotateSize));
     float loss_scale = getSharedData()->replay_buffer_.getLossScale(p);
+    // std::cerr << "[DataLoader] MU before getFeatures pos=" << pos << std::endl;
     std::vector<float> features = env_loader.getFeatures(pos, rotation);
+    // std::cerr << "[DataLoader] MU after getFeatures size=" << features.size() << std::endl;
+
     std::vector<float> action_features, policy, value, reward, tmp;
     for (int step = 0; step <= config::learner_muzero_unrolling_step; ++step) {
         // action features

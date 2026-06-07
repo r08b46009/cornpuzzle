@@ -24,6 +24,7 @@ target_include_directories(
     santorini
     surakarta
     tictactoe
+    cornpuzzle
     stochastic
     stochastic/puzzle2048
     stochastic/tetrisblockpuzzle

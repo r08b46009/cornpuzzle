@@ -4,7 +4,9 @@
 #include <string>
 
 namespace minizero::config {
-
+extern std::string env_compound_puzzles_dir;
+extern bool env_compound_random_select_puzzle;
+extern std::string env_compound_piece_library;
 // program parameters
 extern int program_seed;
 extern bool program_auto_seed;

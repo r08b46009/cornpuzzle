@@ -97,6 +97,11 @@ typedef minizero::env::santorini::SantoriniEnvLoader EnvironmentLoader;
 typedef minizero::env::surakarta::SurakartaAction Action;
 typedef minizero::env::surakarta::SurakartaEnv Environment;
 typedef minizero::env::surakarta::SurakartaEnvLoader EnvironmentLoader;
+#elif CORNPUZZLE
+#include "cornpuzzle.h"
+typedef minizero::env::cornpuzzle::CornPuzzleAction Action;
+typedef minizero::env::cornpuzzle::CornPuzzleEnv Environment;
+typedef minizero::env::cornpuzzle::CornPuzzleEnvLoader EnvironmentLoader;
 #elif TETRISBLOCKPUZZLE
 #include "tetrisblockpuzzle.h"
 typedef minizero::env::tetrisblockpuzzle::TetrisBlockPuzzleAction Action;
