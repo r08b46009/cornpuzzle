@@ -1,5 +1,8 @@
 # MiniZero
 
+scripts/zero-server.sh cornpuzzle CL_new_wo.cfg 200 -n CL_new_wo_gumx_1
+
+
 MiniZero is a zero-knowledge learning framework that supports AlphaZero, MuZero, Gumbel AlphaZero, and Gumbel MuZero algorithms.
 
 This is the official repository of the IEEE ToG paper [MiniZero: Comparative Analysis of AlphaZero and MuZero on Go, Othello, and Atari Games](https://rlg.iis.sinica.edu.tw/papers/minizero).
