@@ -74,6 +74,10 @@ int nn_num_blocks = 1;
 int nn_num_hidden_channels = 256;
 int nn_num_value_hidden_channels = 256;
 std::string nn_type_name = "alphazero";
+int nn_embed_kernel_size = 3;
+std::string nn_blocks_type = "";
+std::string nn_policy_type = "P";
+std::string nn_value_type = "TV";
 
 // environment parameters
 int env_board_size = 0;
@@ -161,6 +165,10 @@ void setConfiguration(ConfigureLoader& cl)
     cl.addParameter("nn_num_hidden_channels", nn_num_hidden_channels, "hyperparameter for the model; the size of the hidden channels in residual blocks", "Network");               // ref: AGZ
     cl.addParameter("nn_num_value_hidden_channels", nn_num_value_hidden_channels, "hyperparameter for the model; the size of the hidden channels in the value network", "Network"); // ref: AGZ
     cl.addParameter("nn_type_name", nn_type_name, "the type of training algorithm and network: alphazero/muzero", "Network");
+    cl.addParameter("nn_embed_kernel_size", nn_embed_kernel_size, "1 or 3, kernel size of the embedding convolution; 1 is a positional embedding; only takes effect when nn_blocks_type is set", "Network"); // ref: ResTNet
+    cl.addParameter("nn_blocks_type", nn_blocks_type, "empty for the legacy all-residual-block network (uses nn_num_blocks); otherwise each block is split by '_', block type: R (residual), T (transformer), e.g. R_T_T is 1 residual block followed by 2 transformer blocks", "Network"); // ref: ResTNet
+    cl.addParameter("nn_policy_type", nn_policy_type, "P (AlphaZero policy head) / TP (transformer policy head); only takes effect when nn_blocks_type is set", "Network");                                                                                                                     // ref: ResTNet
+    cl.addParameter("nn_value_type", nn_value_type, "V (AlphaZero value head) / TV (transformer value head); only takes effect when nn_blocks_type is set", "Network");                                                                                                                        // ref: ResTNet
 
     // environment parameters
     cl.addParameter("env_board_size", env_board_size, "the size of board", "Environment");
@@ -218,6 +226,7 @@ void setConfiguration(ConfigureLoader& cl)
     // [AG] Mastering the game of Go with deep neural networks and tree search
     // [AGZ] Mastering the game of Go without human knowledge
     // [PER] Prioritized Experience Replay
+    // [ResTNet] Bridging Local and Global Knowledge via Transformer in Board Games
 }
 
 } // namespace minizero::config

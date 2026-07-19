@@ -166,6 +166,24 @@ tools/quick-run.sh train tictactoe tictactoe-train.cfg 20
 tools/quick-run.sh train go go_gaz.cfg 100 -conf_str env_board_size=7:nn_num_blocks=2
 ```
 
+### Use ResTNet transformer blocks
+
+The network backbone can mix residual ("R") and transformer ("T") blocks (ref: [Bridging Local and Global Knowledge via Transformer in Board Games](https://rlg.iis.sinica.edu.tw/papers/restnet), IJCAI 2025).
+By default `nn_blocks_type` is empty, which keeps the original all-residual-block network driven by `nn_num_blocks`.
+Set `nn_blocks_type` to opt in, e.g. `R_T_T` for one residual block followed by two transformer blocks.
+
+```bash
+# train with a backbone of 1 residual block + 2 transformer blocks, transformer policy/value heads
+tools/quick-run.sh train cornpuzzle az 300 -conf_str nn_blocks_type=R_T_T:nn_policy_type=TP:nn_value_type=TV
+```
+
+* `nn_embed_kernel_size`: 1 or 3, kernel size of the embedding convolution; 1 is a positional embedding.
+* `nn_blocks_type`: empty for the legacy network; otherwise blocks split by `_`, e.g. `R_T_T`.
+* `nn_policy_type`: `P` (AlphaZero policy head) or `TP` (transformer policy head).
+* `nn_value_type`: `V` (AlphaZero value head) or `TV` (transformer value head).
+
+These only take effect when `nn_blocks_type` is set, and currently require a scalar value head (`env`'s discrete value size == 1), which is the case for CornPuzzle.
+
 ### Set training folder name
 
 The folder name is automatically generated using the important training settings by default; however, it can be explicitly set by flag `-n` as follows.

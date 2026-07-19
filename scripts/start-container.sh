@@ -15,7 +15,7 @@ usage()
 	exit 1
 }
 
-image_name=kds285/minizero:latest
+image_name=yanrudocker/restnet-go
 container_tool=$(basename $(which podman || which docker) 2>/dev/null)
 if [[ ! $container_tool ]]; then
 	echo "Neither podman nor docker is installed." >&2

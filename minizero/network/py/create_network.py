@@ -1,4 +1,5 @@
 from .alphazero_network import AlphaZeroNetwork
+from .transformer_alphazero_network import TransformerAlphaZeroNetwork
 from .muzero_network import MuZeroNetwork
 from .muzero_atari_network import MuZeroAtariNetwork
 
@@ -15,21 +16,42 @@ def create_network(game_name="tietactoe",
                    action_size=9,
                    num_value_hidden_channels=256,
                    discrete_value_size=601,
-                   network_type_name="alphazero"):
+                   network_type_name="alphazero",
+                   embed_kernel_size=3,
+                   blocks_type="",
+                   policy_type="P",
+                   value_type="TV"):
 
     network = None
     if network_type_name == "alphazero":
-        network = AlphaZeroNetwork(game_name,
-                                   num_input_channels,
-                                   input_channel_height,
-                                   input_channel_width,
-                                   num_hidden_channels,
-                                   hidden_channel_height,
-                                   hidden_channel_width,
-                                   num_blocks,
-                                   action_size,
-                                   num_value_hidden_channels,
-                                   discrete_value_size)
+        if blocks_type:
+            # ResTNet: backbone mixes residual ('R') and transformer ('T') blocks, e.g. blocks_type="R_T_T"
+            network = TransformerAlphaZeroNetwork(game_name,
+                                                  num_input_channels,
+                                                  input_channel_height,
+                                                  input_channel_width,
+                                                  num_hidden_channels,
+                                                  hidden_channel_height,
+                                                  hidden_channel_width,
+                                                  action_size,
+                                                  num_value_hidden_channels,
+                                                  discrete_value_size,
+                                                  embed_kernel_size,
+                                                  blocks_type,
+                                                  policy_type,
+                                                  value_type)
+        else:
+            network = AlphaZeroNetwork(game_name,
+                                       num_input_channels,
+                                       input_channel_height,
+                                       input_channel_width,
+                                       num_hidden_channels,
+                                       hidden_channel_height,
+                                       hidden_channel_width,
+                                       num_blocks,
+                                       action_size,
+                                       num_value_hidden_channels,
+                                       discrete_value_size)
     elif network_type_name == "muzero":
         if "atari" in game_name:
             network = MuZeroAtariNetwork(game_name,

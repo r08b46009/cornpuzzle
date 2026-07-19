@@ -90,7 +90,11 @@ class Model:
                                       py.get_nn_action_size(),
                                       py.get_nn_num_value_hidden_channels(),
                                       py.get_nn_discrete_value_size(),
-                                      py.get_nn_type_name())
+                                      py.get_nn_type_name(),
+                                      py.get_nn_embed_kernel_size(),
+                                      py.get_nn_blocks_type(),
+                                      py.get_nn_policy_type(),
+                                      py.get_nn_value_type())
         self.network.to(self.device)
         if py.get_optimizer().lower() == "adam":
             self.optimizer = optim.Adam(self.network.parameters(),

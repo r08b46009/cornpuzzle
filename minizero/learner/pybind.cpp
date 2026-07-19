@@ -59,6 +59,10 @@ PYBIND11_MODULE(minizero_py, m)
     m.def("get_nn_num_value_hidden_channels", []() { return config::nn_num_value_hidden_channels; });
     m.def("get_nn_discrete_value_size", []() { return kEnvInstance->getDiscreteValueSize(); });
     m.def("get_nn_type_name", []() { return config::nn_type_name; });
+    m.def("get_nn_embed_kernel_size", []() { return config::nn_embed_kernel_size; });
+    m.def("get_nn_blocks_type", []() { return config::nn_blocks_type; });
+    m.def("get_nn_policy_type", []() { return config::nn_policy_type; });
+    m.def("get_nn_value_type", []() { return config::nn_value_type; });
 
     py::class_<learner::DataLoader>(m, "DataLoader")
         .def(py::init<std::string>())

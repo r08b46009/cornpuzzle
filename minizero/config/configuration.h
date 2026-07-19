@@ -75,6 +75,10 @@ extern int nn_num_blocks;
 extern int nn_num_hidden_channels;
 extern int nn_num_value_hidden_channels;
 extern std::string nn_type_name;
+extern int nn_embed_kernel_size;
+extern std::string nn_blocks_type;
+extern std::string nn_policy_type;
+extern std::string nn_value_type;
 
 // environment parameters
 extern int env_board_size;
