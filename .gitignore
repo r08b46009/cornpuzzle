@@ -3,6 +3,6 @@ minizero/environment/cornpuzzle/
 __pycache__
 
 # configuration file
-*.cfg
+# *.cfg
 
 
