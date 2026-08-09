@@ -5,6 +5,11 @@ cd /home/yourname/minizero
 bash scripts/start-container.sh
 scripts/zero-server.sh cornpuzzle CL_new_wo.cfg 200 -n CL_new_wo_gumx_1
 ```
+## Demo
+
+<p align="center">
+  <img src="assets/cornpuzzle_56_ece_terminal_color.gif" width="900">
+</p>
 
 ## Run Tranformer blocks
 
