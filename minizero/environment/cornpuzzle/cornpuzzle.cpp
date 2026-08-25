@@ -14,6 +14,9 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace minizero::env::cornpuzzle {
 
@@ -54,6 +57,63 @@ struct CornPuzzleSpec {
     int total_area = 0;
     int raw_piece_count = 0;
 };
+
+struct CurriculumTask {
+    std::string task_id;
+    std::string puzzle_path;
+    std::string solution_path;
+    int prefix = 0;
+};
+
+static std::vector<CurriculumTask> loadCurriculumTasks(const std::string& path)
+{
+    std::vector<CurriculumTask> tasks;
+    std::ifstream fin(path);
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        CurriculumTask task;
+        if (std::getline(iss, task.task_id, '\t') &&
+            std::getline(iss, task.puzzle_path, '\t') &&
+            std::getline(iss, task.solution_path, '\t')) {
+            std::string prefix;
+            if (std::getline(iss, prefix, '\t')) {
+                task.prefix = std::stoi(prefix);
+                tasks.push_back(task);
+            }
+        }
+    }
+    return tasks;
+}
+
+// Allocate one manifest index globally across all SP processes/threads.  The
+// file lock makes an evaluation visit task 0,1,... exactly once per cycle,
+// rather than merely hoping random sampling covers every task.
+static size_t claimSequentialCurriculumIndex(const std::string& path, size_t task_count)
+{
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
+    if (fd < 0 || ::flock(fd, LOCK_EX) != 0) {
+        std::cerr << "[CornPuzzle curriculum] Cannot lock counter file: " << path << std::endl;
+        std::exit(1);
+    }
+    char buffer[64] = {};
+    const ssize_t size = ::read(fd, buffer, sizeof(buffer) - 1);
+    unsigned long long value = 0;
+    if (size > 0) {
+        try { value = std::stoull(buffer); } catch (...) { value = 0; }
+    }
+    const std::string next = std::to_string(value + 1);
+    ::lseek(fd, 0, SEEK_SET);
+    ::ftruncate(fd, 0);
+    if (::write(fd, next.data(), next.size()) < 0) {
+        std::cerr << "[CornPuzzle curriculum] Cannot update counter file: " << path << std::endl;
+        std::exit(1);
+    }
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return static_cast<size_t>(value % task_count);
+}
 
 
 static std::string getConfiguredPuzzleDir()
@@ -616,6 +676,54 @@ void initialize()
 
 void CornPuzzleEnv::reset()
 {
+    if (config::env_cornpuzzle_curriculum_enable &&
+        !config::env_cornpuzzle_curriculum_tasks_file.empty()) {
+        const auto tasks = loadCurriculumTasks(config::env_cornpuzzle_curriculum_tasks_file);
+        if (tasks.empty()) {
+            std::cerr << "[CornPuzzle curriculum] Empty task manifest: "
+                      << config::env_cornpuzzle_curriculum_tasks_file << std::endl;
+            std::exit(1);
+        }
+        if (config::env_cornpuzzle_curriculum_sequential &&
+            config::env_cornpuzzle_curriculum_counter_file.empty()) {
+            std::cerr << "[CornPuzzle curriculum] Sequential evaluation requires "
+                         "env_cornpuzzle_curriculum_counter_file" << std::endl;
+            std::exit(1);
+        }
+        const size_t start = config::env_cornpuzzle_curriculum_sequential
+                                 ? claimSequentialCurriculumIndex(
+                                       config::env_cornpuzzle_curriculum_counter_file, tasks.size())
+                                 : utils::Random::randInt() % tasks.size();
+
+        // Sequential validation must evaluate exactly the claimed task.
+        // Never silently replace a failed task with the next task.
+        if (config::env_cornpuzzle_curriculum_sequential) {
+            const auto& task = tasks[start];
+            if (!resetFromCurriculumTask(task.puzzle_path, task.solution_path,
+                                         task.prefix, task.task_id)) {
+                std::cerr << "[CornPuzzle curriculum] Failed to restore sequential task: "
+                          << task.task_id << std::endl;
+                std::exit(2);
+            }
+            return;
+        }
+
+        // Random training can still fall forward to another valid masked task.
+        for (size_t offset = 0; offset < tasks.size(); ++offset) {
+            const auto& task = tasks[(start + offset) % tasks.size()];
+            if (resetFromCurriculumTask(task.puzzle_path, task.solution_path,
+                                        task.prefix, task.task_id)) {
+                return;
+            }
+        }
+        // A DFS answer may use a placement convention that differs from the
+        // C++ first-empty rule. Never train a terminal masked state: use the
+        // same original puzzle unmasked and report it explicitly.
+        std::cerr << "[CornPuzzle curriculum] No valid masked task in manifest; "
+                  << "falling back to full puzzle " << tasks.front().puzzle_path << std::endl;
+        resetFromPuzzleFile(tasks.front().puzzle_path);
+        return;
+    }
     std::string puzzle_dir = getConfiguredPuzzleDir();
     if (puzzle_dir.empty()) {
         std::cerr << "[CornPuzzle] Please set env_compound_puzzles_dir in cfg."
@@ -643,11 +751,89 @@ void CornPuzzleEnv::resetFromPuzzleFile(const std::string& puzzle_path)
     initial_remaining_ = spec.initial_remaining;
     remaining_ = spec.initial_remaining;
     candidate_shapes_ = spec.candidate_shapes;
+    raw_piece_count_ = spec.raw_piece_count;
+
+    curriculum_task_id_.clear();
+    curriculum_solution_path_.clear();
+    curriculum_prefix_piece_count_ = 0;
+
+    action_phase_ = CornActionPhase::kSelectPiece;
+    pending_piece_id_ = -1;
+    pending_rotation_ = 0;
 
     applyCurriculumMask();
+    initializeLayerStateFromBoard();
 
     reward_ = 0.0f;
     total_reward_ = 0.0f;
+}
+
+bool CornPuzzleEnv::resetFromCurriculumTask(const std::string& puzzle_path,
+                                             const std::string& solution_path,
+                                             int prefix_piece_count,
+                                             const std::string& task_id)
+{
+    resetFromPuzzleFile(puzzle_path);
+    if (prefix_piece_count > 0 && !applySolutionPrefix(solution_path, prefix_piece_count)) return false;
+    curriculum_task_id_ = task_id;
+    curriculum_solution_path_ = solution_path;
+    curriculum_prefix_piece_count_ = prefix_piece_count;
+    initializeLayerStateFromBoard();
+    reward_ = 0.0f;
+    total_reward_ = 0.5f * static_cast<float>(filledCount()) /
+                    static_cast<float>(std::max(1, activeArea()));
+    return !isTerminal();
+}
+
+bool CornPuzzleEnv::applySolutionPrefix(const std::string& solution_path, int prefix_piece_count)
+{
+    std::ifstream fin(solution_path);
+    if (!fin) return false;
+    std::vector<int> labels;
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        int value;
+        while (iss >> value) labels.push_back(value);
+    }
+    if (labels.size() < static_cast<size_t>(activeArea())) return false;
+    const int limit = std::min(prefix_piece_count, raw_piece_count_);
+    for (int label = 1; label <= limit; ++label) {
+        std::vector<std::pair<int, int>> solution_cells;
+        for (int r = 0; r < active_rows_; ++r) {
+            for (int c = 0; c < active_cols_; ++c) {
+                if (labels[r * active_cols_ + c] == label) {
+                    solution_cells.push_back({r, c});
+                }
+            }
+        }
+        if (solution_cells.empty()) return false;
+
+        // Solution labels are not guaranteed to follow raw puzzle-piece order.
+        // Match by canonical geometry instead. Trying every circular column
+        // shift correctly unwraps pieces that cross the left/right boundary.
+        int candidate = -1;
+        for (int shift = 0; shift < active_cols_ && candidate < 0; ++shift) {
+            std::vector<std::pair<int, int>> shifted;
+            for (auto [r, c] : solution_cells) {
+                shifted.push_back({r, (c + shift) % active_cols_});
+            }
+            const std::string key = canonicalShapeKey180(shifted);
+            for (const auto& shape : candidate_shapes_) {
+                if (shape.shape_key == key && remaining_[shape.candidate_id] > 0) {
+                    candidate = shape.candidate_id;
+                    break;
+                }
+            }
+        }
+        if (candidate < 0 || remaining_[candidate] <= 0) return false;
+        for (auto [r, c] : solution_cells) {
+            board_[r * kCornPuzzleCols + c] = candidate + 1;
+        }
+        --remaining_[candidate];
+    }
+    return areaMatchesRemaining();
 }
 
 void CornPuzzleEnv::applyCurriculumMask()
@@ -699,47 +885,345 @@ int CornPuzzleEnv::filledCount() const
     return filled;
 }
 
-int CornPuzzleEnv::firstEmptyPos() const
+bool CornPuzzleEnv::resolvePositionPlacement(
+    const CornPlacement& action_placement,
+    int position,
+    CornPlacement& resolved) const
+{
+    if (position < 0 || position >= kCornPuzzlePlayableArea) {
+        return false;
+    }
+    if (action_placement.cells.empty()) {
+        return false;
+    }
+
+    int target_r = position / kCornPuzzleCols;
+    int target_c = position % kCornPuzzleCols;
+    if (target_r >= active_rows_ || target_c >= active_cols_) {
+        return false;
+    }
+
+    resolved = action_placement;
+
+    // The position action selects the board cell occupied by the first
+    // normalized cell of the rotated shape. Columns retain active-board wrap.
+    auto [anchor_dr, anchor_dc] = resolved.cells[0];
+    resolved.top = target_r - anchor_dr;
+    resolved.left = wrapColActive(target_c - anchor_dc, active_cols_);
+    return true;
+}
+
+bool CornPuzzleEnv::isLayerRowFull(int row) const
+{
+    if (row < 0 || row >= active_rows_) {
+        return true;
+    }
+
+    for (int c = 0; c < active_cols_; ++c) {
+        if (board_[row * kCornPuzzleCols + c] == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int CornPuzzleEnv::findTopmostUnfinishedRow() const
 {
     for (int r = 0; r < active_rows_; ++r) {
-        for (int c = 0; c < active_cols_; ++c) {
-            int pos = r * kCornPuzzleCols + c;
-            if (board_[pos] == 0) {
-                return pos;
+        if (!isLayerRowFull(r)) {
+            return r;
+        }
+    }
+    return active_rows_;
+}
+
+int CornPuzzleEnv::getForcedLayerTargetPosition() const
+{
+    if (first_piece_of_layer_ ||
+        current_layer_row_ < 0 ||
+        current_layer_row_ >= active_rows_ ||
+        active_cols_ <= 0) {
+        return -1;
+    }
+
+    const int row = current_layer_row_;
+
+    auto is_empty = [&](int c) -> bool {
+        return c >= 0 &&
+               c < active_cols_ &&
+               board_[row * kCornPuzzleCols + c] == 0;
+    };
+
+    // ============================================================
+    // Detect a wrap segment.
+    //
+    // Example:
+    //
+    // col:  0 1 2 3 4 ... 10 11 12 13
+    //       . . X X X ...  .  .  X  .
+    //
+    // The empty cells at:
+    //
+    //       [13] + [0,1]
+    //
+    // belong to one boundary-crossing / wrap segment.
+    //
+    // We want to solve normal interior holes first and leave this
+    // wrap segment until the end.
+    // ============================================================
+
+    int leading_empty_end = 0;
+
+    while (leading_empty_end < active_cols_ &&
+           is_empty(leading_empty_end)) {
+        ++leading_empty_end;
+    }
+
+    int trailing_empty_start = active_cols_;
+
+    while (trailing_empty_start > 0 &&
+           is_empty(trailing_empty_start - 1)) {
+        --trailing_empty_start;
+    }
+
+    // A true wrap segment exists only when BOTH boundaries are empty
+    // and there is some occupied/non-wrap region between them.
+    const bool has_wrap_segment =
+        leading_empty_end > 0 &&
+        trailing_empty_start < active_cols_ &&
+        leading_empty_end < trailing_empty_start;
+
+    auto belongs_to_wrap_segment = [&](int c) -> bool {
+        if (!has_wrap_segment) {
+            return false;
+        }
+
+        return c < leading_empty_end ||
+               c >= trailing_empty_start;
+    };
+
+    // ============================================================
+    // Priority 1:
+    // Solve INTERIOR empty cells first.
+    //
+    // Preserve the old rightward tendency:
+    // begin from layer_next_scan_col_ and scan circularly,
+    // BUT skip the boundary wrap component.
+    // ============================================================
+
+    const int scan_start =
+        wrapColActive(layer_next_scan_col_, active_cols_);
+
+    for (int offset = 0; offset < active_cols_; ++offset) {
+        const int c =
+            wrapColActive(scan_start + offset, active_cols_);
+
+        if (!is_empty(c)) {
+            continue;
+        }
+
+        if (belongs_to_wrap_segment(c)) {
+            continue;
+        }
+
+        return row * kCornPuzzleCols + c;
+    }
+
+    // ============================================================
+    // Priority 2:
+    // No interior holes remain.
+    //
+    // Now solve the wrap segment.
+    //
+    // IMPORTANT:
+    // Start from the RIGHT boundary first:
+    //
+    //        ... col13 -> col0 -> col1
+    //
+    // This allows a wrapping piece whose anchor is at the right edge.
+    // ============================================================
+
+    if (has_wrap_segment) {
+        for (int c = trailing_empty_start;
+             c < active_cols_;
+             ++c) {
+
+            if (is_empty(c)) {
+                return row * kCornPuzzleCols + c;
             }
+        }
+
+        for (int c = 0;
+             c < leading_empty_end;
+             ++c) {
+
+            if (is_empty(c)) {
+                return row * kCornPuzzleCols + c;
+            }
+        }
+    }
+
+    // ============================================================
+    // Safety fallback.
+    //
+    // Normally we should already have returned above.
+    // Keep the old deterministic behavior if the row has some
+    // unusual geometry.
+    // ============================================================
+
+    for (int offset = 0; offset < active_cols_; ++offset) {
+        const int c =
+            wrapColActive(scan_start + offset, active_cols_);
+
+        if (is_empty(c)) {
+            return row * kCornPuzzleCols + c;
         }
     }
 
     return -1;
 }
 
-bool CornPuzzleEnv::resolveFirstEmptyPlacement(
-    const CornPlacement& action_placement,
-    CornPlacement& resolved) const
+
+void CornPuzzleEnv::initializeLayerStateFromBoard()
 {
-    int target_pos = firstEmptyPos();
-    if (target_pos < 0) {
+    current_layer_row_ = findTopmostUnfinishedRow();
+    first_piece_of_layer_ = true;
+    layer_next_scan_col_ = 0;
+
+    if (current_layer_row_ >= active_rows_) {
+        return;
+    }
+
+    // Empty row = genuine start of a new layer.
+    // Keep the normal free Two-Step first placement.
+    bool has_occupied = false;
+    for (int c = 0; c < active_cols_; ++c) {
+        if (board_[current_layer_row_ * kCornPuzzleCols + c] > 0) {
+            has_occupied = true;
+            break;
+        }
+    }
+
+    if (!has_occupied) {
+        return;
+    }
+
+    // A legacy curriculum prefix does not store the original RightTrim
+    // cursor. Reconstruct it geometrically.
+    //
+    // Instead of blindly using the leftmost empty cell, scan empty anchors
+    // from left to right and choose the first anchor at which at least one
+    // remaining piece/rotation can actually be placed.
+    first_piece_of_layer_ = false;
+
+    for (int c = 0; c < active_cols_; ++c) {
+        if (board_[current_layer_row_ * kCornPuzzleCols + c] != 0) {
+            continue;
+        }
+
+        layer_next_scan_col_ = c;
+
+        const int target = getForcedLayerTargetPosition();
+        if (target < 0) {
+            continue;
+        }
+
+        for (int action_id = 0;
+             action_id < static_cast<int>(kCornPuzzleActions.size());
+             ++action_id) {
+
+            CornPlacement placement;
+
+            if (!makeActionPlacement(action_id, placement) ||
+                placement.cells.empty() ||
+                remaining_[placement.piece_id] <= 0) {
+                continue;
+            }
+
+            CornPlacement resolved;
+
+            if (resolvePositionPlacement(placement, target, resolved) &&
+                canPlace(resolved)) {
+                return;
+            }
+        }
+    }
+
+    // No geometrically legal continuation was found.
+    // Keep a deterministic empty target. isTerminal() will mark this state
+    // invalid and sequential validation will now report the exact task ID
+    // instead of silently substituting another task.
+    for (int c = 0; c < active_cols_; ++c) {
+        if (board_[current_layer_row_ * kCornPuzzleCols + c] == 0) {
+            layer_next_scan_col_ = c;
+            return;
+        }
+    }
+}
+
+void CornPuzzleEnv::updateLayerStateAfterPlacement(int placed_position, bool was_first_piece)
+{
+    if (current_layer_row_ < 0 || current_layer_row_ >= active_rows_) {
+        current_layer_row_ = findTopmostUnfinishedRow();
+    }
+
+    // Completing the current reference row is the only layer-boundary rule.
+    // This naturally skips any lower rows that were already completed by
+    // pieces protruding from an earlier layer.
+    if (current_layer_row_ >= active_rows_ || isLayerRowFull(current_layer_row_)) {
+        current_layer_row_ = findTopmostUnfinishedRow();
+        first_piece_of_layer_ = true;
+        layer_next_scan_col_ = 0;
+        return;
+    }
+
+    if (placed_position >= 0 && placed_position < kCornPuzzlePlayableArea) {
+        const int placed_col = placed_position % kCornPuzzleCols;
+        layer_next_scan_col_ = wrapColActive(placed_col + 1, active_cols_);
+    }
+
+    if (was_first_piece) {
+        first_piece_of_layer_ = false;
+    }
+}
+
+bool CornPuzzleEnv::candidateHasLegalFirstLayerPosition(const CornPlacement& placement) const
+{
+    if (current_layer_row_ < 0 || current_layer_row_ >= active_rows_) {
         return false;
     }
 
-    if (action_placement.cells.empty()) {
+    // The first piece may choose any column, but it must start on the current
+    // topmost unfinished row.  This is the only free placement in the layer.
+    for (int c = 0; c < active_cols_; ++c) {
+        const int position = current_layer_row_ * kCornPuzzleCols + c;
+        CornPlacement resolved;
+        if (resolvePositionPlacement(placement, position, resolved) && canPlace(resolved)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CornPuzzleEnv::candidateHasForcedRightPlacement(const CornPlacement& placement) const
+{
+    const int target = getForcedLayerTargetPosition();
+    if (target < 0) {
         return false;
     }
 
-    int target_r = target_pos / kCornPuzzleCols;
-    int target_c = target_pos % kCornPuzzleCols;
+    CornPlacement resolved;
+    return resolvePositionPlacement(placement, target, resolved) && canPlace(resolved);
+}
 
-    resolved = action_placement;
-
-    // Deterministic placement rule:
-    // align the first normalized cell of the selected rotated piece to the
-    // current first-empty board cell. Columns still use active wrapping.
-    auto [anchor_dr, anchor_dc] = resolved.cells[0];
-
-    resolved.top = target_r - anchor_dr;
-    resolved.left = wrapColActive(target_c - anchor_dc, active_cols_);
-
-    return true;
+bool CornPuzzleEnv::makePendingPlacement(CornPlacement& placement) const
+{
+    if (pending_piece_id_ < 0 || pending_piece_id_ >= kCornPuzzleNumPieces) {
+        return false;
+    }
+    const int rot_idx = (pending_rotation_ == 180) ? 1 : 0;
+    return makeActionPlacement(pending_piece_id_ * kCornPuzzleNumRotations + rot_idx,
+                               placement);
 }
 
 bool CornPuzzleEnv::makeActionPlacement(int action_id, CornPlacement& placement) const
@@ -803,20 +1287,41 @@ bool CornPuzzleEnv::act(const CornPuzzleAction& action)
         return false;
     }
 
+    if (action_phase_ == CornActionPhase::kSelectPiece) {
+        CornPlacement selected;
+        if (!makeActionPlacement(action.getActionID(), selected)) {
+            return false;
+        }
+
+        pending_piece_id_ = selected.piece_id;
+        pending_rotation_ = selected.rotation;
+        action_phase_ = CornActionPhase::kSelectPosition;
+        reward_ = 0.0f;
+        actions_.push_back(action);
+        turn_ = Player::kPlayer1;
+        return true;
+    }
+
     CornPlacement action_placement;
-    if (!makeActionPlacement(action.getActionID(), action_placement)) {
+    if (!makePendingPlacement(action_placement)) {
         return false;
     }
 
     CornPlacement resolved;
-    if (!resolveFirstEmptyPlacement(action_placement, resolved)) {
+    if (!resolvePositionPlacement(action_placement, action.getActionID(), resolved)) {
         return false;
     }
 
+    const bool was_first_piece = first_piece_of_layer_;
+    const int placed_position = action.getActionID();
     int filled_before = filledCount();
 
     place(resolved);
+    updateLayerStateAfterPlacement(placed_position, was_first_piece);
     actions_.push_back(action);
+    action_phase_ = CornActionPhase::kSelectPiece;
+    pending_piece_id_ = -1;
+    pending_rotation_ = 0;
 
     int filled_after = filledCount();
 
@@ -916,9 +1421,7 @@ std::vector<CornPuzzleAction> CornPuzzleEnv::getLegalActions() const
         return actions;
     }
 
-    // Reduced action-space version:
-    // Each action only selects piece type + rotation. The position is resolved
-    // by aligning the piece to the current first-empty cell.
+    // The same fixed 128 action IDs have phase-dependent meanings.
     for (int action_id = 0; action_id < static_cast<int>(kCornPuzzleActions.size()); ++action_id) {
         CornPuzzleAction action(action_id, Player::kPlayer1);
 
@@ -942,21 +1445,52 @@ bool CornPuzzleEnv::isLegalAction(const CornPuzzleAction& action) const
         return false;
     }
 
-    CornPlacement action_placement;
-    if (!makeActionPlacement(action_id, action_placement)) {
+    if (action_phase_ == CornActionPhase::kSelectPiece) {
+        CornPlacement action_placement;
+        if (!makeActionPlacement(action_id, action_placement) ||
+            action_placement.cells.empty() ||
+            remaining_[action_placement.piece_id] <= 0) {
+            return false;
+        }
+
+        // Keep the original two-stage action IDs, but only the first piece in
+        // each layer has a free position choice.  Later pieces are legal only
+        // when their trimmed/normalized geometry fits at the forced rightward
+        // target cell.
+        if (first_piece_of_layer_) {
+            return candidateHasLegalFirstLayerPosition(action_placement);
+        }
+        return candidateHasForcedRightPlacement(action_placement);
+    }
+
+    // In the position phase only 7x14 coordinate IDs can be used.
+    if (action_id >= kCornPuzzlePlayableArea) {
         return false;
     }
 
-    if (action_placement.cells.empty()) {
+    if (current_layer_row_ < 0 || current_layer_row_ >= active_rows_) {
         return false;
     }
 
+    // First piece: position action is free across the current layer row.
+    // Continuation pieces: exactly one position action remains legal, namely
+    // the first empty cell reached by scanning right from the prior anchor.
+    if (first_piece_of_layer_) {
+        if (action_id / kCornPuzzleCols != current_layer_row_) {
+            return false;
+        }
+    } else {
+        const int forced_target = getForcedLayerTargetPosition();
+        if (forced_target < 0 || action_id != forced_target) {
+            return false;
+        }
+    }
+
+    CornPlacement pending;
     CornPlacement resolved;
-    if (!resolveFirstEmptyPlacement(action_placement, resolved)) {
-        return false;
-    }
-
-    return canPlace(resolved);
+    return makePendingPlacement(pending) &&
+           resolvePositionPlacement(pending, action_id, resolved) &&
+           canPlace(resolved);
 }
 
 bool CornPuzzleEnv::isTerminal() const
@@ -979,9 +1513,20 @@ std::vector<float> CornPuzzleEnv::getFeatures(utils::Rotation rotation) const
     std::vector<float> features;
     features.reserve(getNumInputChannels() * kCornPuzzleBoardSize);
 
-    // Channel 0: playable empty cells
+    // Channel 0: playable empty cells.
+    // In right-trim continuation mode, mark the single forced target with
+    // 0.5 instead of 1.0.  This preserves the exact input tensor shape of the
+    // pretrained two-stage model while making the extra layer state observable
+    // (and therefore Markov) to the network.
+    const int forced_layer_target = getForcedLayerTargetPosition();
     for (int pos = 0; pos < kCornPuzzleBoardSize; ++pos) {
-        features.push_back(board_[pos] == 0 ? 1.0f : 0.0f);
+        if (board_[pos] != 0) {
+            features.push_back(0.0f);
+        } else if (pos == forced_layer_target) {
+            features.push_back(0.5f);
+        } else {
+            features.push_back(1.0f);
+        }
     }
 
     // Channel 1: occupied cells
@@ -1013,12 +1558,21 @@ std::vector<float> CornPuzzleEnv::getFeatures(utils::Rotation rotation) const
         std::array<float, kCornPuzzleBoardSize> plane = {};
         plane.fill(0.0f);
 
-        if (p < static_cast<int>(candidate_shapes_.size()) && remaining_[p] > 0) {
+        if (p < static_cast<int>(candidate_shapes_.size()) && remaining_[p] > 0 &&
+            (action_phase_ == CornActionPhase::kSelectPiece || p == pending_piece_id_)) {
             float denom = static_cast<float>(std::max(1, kCornPuzzleRemainingCountNorm));
             float v = static_cast<float>(remaining_[p]) / denom;
             v = std::min(v, 1.0f);
 
-            for (auto [dr, dc] : candidate_shapes_[p].cells) {
+            auto visible_cells = candidate_shapes_[p].cells;
+            if (action_phase_ == CornActionPhase::kSelectPosition) {
+                // Negative, rotated geometry simultaneously identifies the
+                // selected piece, rotation, and position-selection phase
+                // without changing the 67-channel network input shape.
+                visible_cells = applyRotation(visible_cells, pending_rotation_);
+                v = -1.0f;
+            }
+            for (auto [dr, dc] : visible_cells) {
                 if (dr >= 0 && dr < kCornPuzzleRows && dc >= 0 && dc < kCornPuzzleCols) {
                     plane[dr * kCornPuzzleCols + dc] = v;
                 }
@@ -1044,17 +1598,23 @@ std::vector<float> CornPuzzleEnv::getActionFeatures(const CornPuzzleAction& acti
     }
 
     CornPlacement placement;
-    if (!makeActionPlacement(action.getActionID(), placement)) {
-        return action_features;
+    if (action_phase_ == CornActionPhase::kSelectPiece) {
+        if (!makeActionPlacement(action.getActionID(), placement)) {
+            return action_features;
+        }
+    } else {
+        CornPlacement pending;
+        if (!makePendingPlacement(pending) ||
+            !resolvePositionPlacement(pending, action.getActionID(), placement)) {
+            return action_features;
+        }
     }
 
-    // Because the reduced action no longer contains an explicit board position,
-    // the action feature represents only the selected rotated candidate shape.
-    // The environment will decide the real position from the current first-empty
-    // cell when act() / isLegalAction() is called.
     for (auto [dr, dc] : placement.cells) {
-        if (dr >= 0 && dr < kCornPuzzleRows && dc >= 0 && dc < kCornPuzzleCols) {
-            action_features[dr * kCornPuzzleCols + dc] = 1.0f;
+        int r = placement.top + dr;
+        int c = wrapColActive(placement.left + dc, active_cols_);
+        if (r >= 0 && r < kCornPuzzleRows && c >= 0 && c < kCornPuzzleCols) {
+            action_features[r * kCornPuzzleCols + c] = 1.0f;
         }
     }
 
@@ -1067,7 +1627,9 @@ static bool useCornPuzzleColorOutput()
     const char* flag = std::getenv("CORNPUZZLE_COLOR");
 
     if (flag == nullptr) {
-        return false;
+        // Let self-play workers inherit color from the cfg.  The environment
+        // variable remains an optional explicit override for compatibility.
+        return minizero::config::program_use_color_message;
     }
 
     std::string value(flag);
@@ -1139,6 +1701,23 @@ static std::string cornCellToken(int board_value)
     return cell.str();
 }
 
+std::string CornPuzzleEnv::actionToConsoleString(const CornPuzzleAction& action) const
+{
+    if (action_phase_ == CornActionPhase::kSelectPiece) {
+        return action.toConsoleString();
+    }
+
+    const int position = action.getActionID();
+    if (position < 0 || position >= kCornPuzzlePlayableArea) {
+        return "L?";
+    }
+
+    std::ostringstream oss;
+    oss << "L" << (position / kCornPuzzleCols)
+        << "," << (position % kCornPuzzleCols);
+    return oss.str();
+}
+
 std::string CornPuzzleEnv::toString() const
 {
     const bool use_color = useCornPuzzleColorOutput();
@@ -1147,7 +1726,22 @@ std::string CornPuzzleEnv::toString() const
 
     oss << "active_rows=" << active_rows_
         << ", active_cols=" << active_cols_
+        << ", phase=" << (action_phase_ == CornActionPhase::kSelectPiece
+                                ? "SELECT_PIECE" : "SELECT_POSITION")
+        << ", layer_row=" << current_layer_row_
+        << ", layer_mode=" << (first_piece_of_layer_ ? "FIRST_FREE" : "RIGHT_TRIM")
         << "\n";
+
+    const int forced_target = getForcedLayerTargetPosition();
+    if (forced_target >= 0) {
+        oss << "forced_target=L" << (forced_target / kCornPuzzleCols)
+            << "," << (forced_target % kCornPuzzleCols) << "\n";
+    }
+
+    if (action_phase_ == CornActionPhase::kSelectPosition) {
+        oss << "pending=P" << (pending_piece_id_ + 1)
+            << "R" << pending_rotation_ << "\n";
+    }
 
     oss << "    ";
     for (int c = 0; c < kCornPuzzleCols; ++c) {
@@ -1191,7 +1785,10 @@ std::vector<float> CornPuzzleEnvLoader::getFeatures(const int pos, utils::Rotati
 {
     CornPuzzleEnv env;
 
-    if (!getPuzzlePath().empty()) {
+    if (!getCurriculumTaskID().empty()) {
+        env.resetFromCurriculumTask(getPuzzlePath(), getCurriculumSolutionPath(),
+                                    getCurriculumPrefix(), getCurriculumTaskID());
+    } else if (!getPuzzlePath().empty()) {
         env.resetFromPuzzleFile(getPuzzlePath());
     }
 
@@ -1206,7 +1803,10 @@ std::vector<float> CornPuzzleEnvLoader::getActionFeatures(const int pos, utils::
 {
     CornPuzzleEnv env;
 
-    if (!getPuzzlePath().empty()) {
+    if (!getCurriculumTaskID().empty()) {
+        env.resetFromCurriculumTask(getPuzzlePath(), getCurriculumSolutionPath(),
+                                    getCurriculumPrefix(), getCurriculumTaskID());
+    } else if (!getPuzzlePath().empty()) {
         env.resetFromPuzzleFile(getPuzzlePath());
     }
 
