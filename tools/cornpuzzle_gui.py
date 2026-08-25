@@ -4,16 +4,20 @@
 A small standalone tool (Tkinter only, no extra pip installs needed) that:
   * reads a CornPuzzle puzzle file, any filename/extension (``# rows N`` /
     ``# cols N`` header followed by blank-line separated 0/1 piece shapes),
-  * draws the empty board according to the header size,
+  * also reads a CornPuzzle *_solution.txt answer-key file (same header,
+    followed by a grid of whitespace-separated piece numbers) and loads it
+    as an already-solved board -- the pieces are still fully draggable,
+  * draws the board according to the header size,
   * lists every piece at the bottom of the window in its own color,
   * lets you drag pieces with the mouse onto the board.
 
 Run with:
     python cornpuzzle_gui.py [folder]
 
-``folder`` should contain the puzzle files (e.g. ``cornpuzzle/71424``); any
-file in it can be loaded regardless of extension, as long as its content
-matches the ``# rows`` / ``# cols`` + 0/1 grid format. Use "開檔案..." in the
+``folder`` should contain the puzzle/solution files (e.g. ``cornpuzzle/71424``
+or an ``answers`` folder full of ``*_solution.txt`` files); any file in it
+can be loaded regardless of extension -- the format (blank puzzle vs. solved
+answer key) is auto-detected from its content. Use "Open File..." in the
 toolbar to load a single file from anywhere, extension-agnostic too.
 If no folder is given, the script looks for a ``71424`` folder next to
 itself, and otherwise lets you pick a folder from a dialog.
@@ -106,6 +110,106 @@ def parse_puzzle_file(path: Path) -> tuple[int, int, list[list[Cell]]]:
     if rows is None or cols is None:
         raise ValueError(f"{path.name}: missing '# rows' / '# cols' header")
     return rows, cols, pieces
+
+
+def looks_like_solution_file(path: Path) -> bool:
+    """Detect a solved-answer file vs. a regular puzzle-piece file.
+
+    Puzzle piece blocks are a single 0/1 token per row (no whitespace).
+    Solution grids are whitespace-separated piece-number integers per row
+    (e.g. " 1  2  2  2 ..."), so the first content line tells them apart.
+    """
+    with open(path, encoding='utf-8') as f:
+        for raw_line in f:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            return len(stripped.split()) > 1
+    return False
+
+
+def parse_solution_file(path: Path) -> tuple[int, int, list[list[int]]]:
+    """Parse a CornPuzzle ``*_solution.txt`` answer-key file.
+
+    Returns (rows, cols, grid) where grid[r][c] is the 1-based piece number
+    (matching that piece's order in the corresponding puzzle file) covering
+    board cell (r, c), or 0 for an uncovered cell.
+    """
+    rows = cols = None
+    grid: list[list[int]] = []
+
+    with open(path, encoding='utf-8') as f:
+        for raw_line in f:
+            stripped = raw_line.strip()
+            if stripped.startswith('#'):
+                parts = stripped.lstrip('#').split()
+                if len(parts) >= 2:
+                    if parts[0] == 'rows':
+                        rows = int(parts[1])
+                    elif parts[0] == 'cols':
+                        cols = int(parts[1])
+                continue
+            if stripped == '':
+                continue
+            grid.append([int(tok) for tok in stripped.split()])
+
+    if rows is None or cols is None:
+        raise ValueError(f"{path.name}: missing '# rows' / '# cols' header")
+    if len(grid) != rows or any(len(row) != cols for row in grid):
+        raise ValueError(f"{path.name}: grid size does not match the declared rows/cols header")
+    return rows, cols, grid
+
+
+def unwrap_piece_columns(cells: list[Cell], cols: int) -> tuple[int, list[Cell]]:
+    """Undo column-wrapping for a piece's raw board cells.
+
+    A piece placed near the right/left edge may have its cells folded onto
+    both ends of the board (e.g. columns 0, 1 and 13 on a 14-wide board,
+    which are actually contiguous once you unwrap the circular column
+    axis -- see wrapColActive in the C++ env). Find the largest run of
+    *unused* columns around that circle and cut the circle open right
+    after it; that reconstructs the piece's original, contiguous shape
+    (and works unchanged for non-wrapped pieces too, since then the "gap"
+    is just every column the piece doesn't touch).
+
+    Returns (start_col, cells_with_unwrapped_columns), where start_col is
+    the board column that maps back to local column 0.
+    """
+    used_cols = sorted(set(c for _, c in cells))
+    best_gap = -1
+    start_col = used_cols[0]
+    for i, a in enumerate(used_cols):
+        b = used_cols[(i + 1) % len(used_cols)]
+        gap = (b - a - 1) % cols if len(used_cols) > 1 else cols - 1
+        if gap > best_gap:
+            best_gap = gap
+            start_col = b if len(used_cols) > 1 else a
+    unwrapped = [(r, (c - start_col) % cols) for r, c in cells]
+    return start_col, unwrapped
+
+
+def solution_grid_to_pieces(grid: list[list[int]], cols: int) -> list[tuple[Cell, list[Cell]]]:
+    """Group a solved board grid by piece number.
+
+    Returns a list of (origin, normalized_cells), one per piece, ordered by
+    ascending piece number (i.e. the piece's original order in the puzzle
+    file). `origin` is the piece's bounding-box top-left in board
+    coordinates (its column already accounts for wrapColActive, so
+    re-placing the piece at `origin` reproduces the exact wrapped layout).
+    """
+    by_id: dict[int, list[Cell]] = {}
+    for r, row in enumerate(grid):
+        for c, pid in enumerate(row):
+            if pid > 0:
+                by_id.setdefault(pid, []).append((r, c))
+
+    entries = []
+    for pid in sorted(by_id):
+        start_col, unwrapped = unwrap_piece_columns(by_id[pid], cols)
+        min_r = min(r for r, _ in unwrapped)
+        normalized = sorted((r - min_r, c) for r, c in unwrapped)
+        entries.append(((min_r, start_col), normalized))
+    return entries
 
 
 def rotate_cells_cw(cells: list[Cell]) -> list[Cell]:
@@ -229,17 +333,17 @@ class CornPuzzleApp:
         top = ttk.Frame(self.root, padding=6)
         top.pack(side='top', fill='x')
 
-        ttk.Button(top, text="開資料夾...", command=self.browse_folder).pack(side='left')
-        ttk.Button(top, text="開檔案...", command=self.browse_file).pack(side='left', padx=(4, 0))
+        ttk.Button(top, text="Open Folder...", command=self.browse_folder).pack(side='left')
+        ttk.Button(top, text="Open File...", command=self.browse_file).pack(side='left', padx=(4, 0))
 
         self.file_var = tk.StringVar()
         self.file_combo = ttk.Combobox(top, textvariable=self.file_var, state='readonly', width=32)
         self.file_combo.pack(side='left', padx=6)
         self.file_combo.bind('<<ComboboxSelected>>', lambda _e: self.load_file(self.file_var.get()))
 
-        ttk.Button(top, text="重置 Reset", command=self.reset_current_file).pack(side='left', padx=6)
+        ttk.Button(top, text="Reset", command=self.reset_current_file).pack(side='left', padx=6)
 
-        self.status_var = tk.StringVar(value="尚未載入拼圖")
+        self.status_var = tk.StringVar(value="No puzzle loaded")
         ttk.Label(top, textvariable=self.status_var).pack(side='left', padx=12)
 
         canvas_frame = ttk.Frame(self.root)
@@ -263,7 +367,7 @@ class CornPuzzleApp:
     # -- file / folder handling --------------------------------------------
     def browse_folder(self) -> None:
         from tkinter import filedialog
-        folder = filedialog.askdirectory(title="選擇存放拼圖檔案的資料夾")
+        folder = filedialog.askdirectory(title="Select a folder containing puzzle / solution files")
         if folder:
             self.load_folder(Path(folder))
 
@@ -271,7 +375,7 @@ class CornPuzzleApp:
         from tkinter import filedialog
         initial_dir = str(self.folder) if self.folder is not None else None
         chosen = filedialog.askopenfilename(
-            title="選擇拼圖檔案(不限副檔名)",
+            title="Select a puzzle or solution file (any extension)",
             initialdir=initial_dir,
             filetypes=[("All files", "*.*")])
         if not chosen:
@@ -282,7 +386,7 @@ class CornPuzzleApp:
     def load_folder(self, folder: Path, select: str | None = None) -> None:
         files = sorted(p.name for p in folder.iterdir() if p.is_file())
         if not files:
-            messagebox.showerror("找不到檔案", f"{folder} 裡沒有檔案")
+            messagebox.showerror("No files found", f"No files in {folder}")
             return
         self.folder = folder
         self.file_combo['values'] = files
@@ -298,18 +402,44 @@ class CornPuzzleApp:
         assert self.folder is not None
         path = self.folder / filename
         try:
-            rows, cols, piece_cells_list = parse_puzzle_file(path)
+            if looks_like_solution_file(path):
+                rows, cols, grid = parse_solution_file(path)
+                self._apply_solution(rows, cols, grid)
+            else:
+                rows, cols, piece_cells_list = parse_puzzle_file(path)
+                self._apply_puzzle(rows, cols, piece_cells_list)
         except Exception as exc:  # noqa: BLE001 - show any parse error to the user
-            messagebox.showerror("讀取失敗", f"{path.name}: {exc}")
+            messagebox.showerror("Load failed", f"{path.name}: {exc}")
             return
 
+        self.drag_piece = None
+        self.drag_from = None
+        self.redraw()
+
+    def _apply_puzzle(self, rows: int, cols: int, piece_cells_list: list[list[Cell]]) -> None:
+        """Load a blank puzzle: every piece starts unplaced, in the tray."""
         self.rows, self.cols = rows, cols
         colors = make_palette(len(piece_cells_list))
         self.pieces = [Piece(i, cells, colors[i]) for i, cells in enumerate(piece_cells_list)]
         self.board = {}
-        self.drag_piece = None
-        self.drag_from = None
-        self.redraw()
+
+    def _apply_solution(self, rows: int, cols: int, grid: list[list[int]]) -> None:
+        """Load a solved answer key: every piece starts already placed on the
+        board (in its solved position), but remains fully draggable, same as
+        a piece the user placed themselves."""
+        self.rows, self.cols = rows, cols
+        entries = solution_grid_to_pieces(grid, cols)
+        colors = make_palette(len(entries))
+        self.pieces = []
+        self.board = {}
+        for idx, (origin, cells) in enumerate(entries):
+            piece = Piece(idx, cells, colors[idx])
+            piece.placed = True
+            piece.origin = origin
+            self.pieces.append(piece)
+            orow, ocol = origin
+            for dr, dc in cells:
+                self.board[(orow + dr, wrap_col(ocol + dc, cols))] = piece.id
 
     # -- geometry helpers ---------------------------------------------------
     def occupied_cells(self, exclude_piece_id: int | None = None) -> set[Cell]:
@@ -349,7 +479,7 @@ class CornPuzzleApp:
 
         self.canvas.create_text(
             MARGIN, board_bottom + MARGIN, anchor='w', font=('TkDefaultFont', 11, 'bold'),
-            text="拼圖片(拖曳到棋盤上放置;右鍵:未放置的旋轉 / 已放置的收回)")
+            text="Pieces (drag onto the board to place; right-click: rotate unplaced / return placed to tray)")
 
         unplaced = [p for p in self.pieces if not p.placed and p is not self.drag_piece]
         self.tray_slot_pieces: dict[int, Piece] = {}
@@ -361,17 +491,22 @@ class CornPuzzleApp:
             self.canvas.create_rectangle(sx, sy, sx + SLOT_SIZE - 8, sy + SLOT_SIZE - 8, outline='#cccccc')
             self._draw_piece_cells(piece.cells, sx, sy, SLOT_SIZE - 8, SLOT_SIZE - 8, TRAY_CELL, piece.color)
 
+        # Fix the scrollregion to the static board/tray layout before drawing
+        # the drag ghost -- otherwise every mouse-move while dragging (the
+        # ghost follows the cursor, and can sit outside the normal layout
+        # e.g. near the top edge) reshapes bbox('all') and the scrollbar
+        # keeps re-centering, making the whole view appear to jump around.
+        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+
         # drag ghost, drawn last (on top)
         if self.drag_piece is not None and mouse_xy is not None:
             self._draw_drag_ghost(mouse_xy)
 
         total = len(self.pieces)
         placed = sum(1 for p in self.pieces if p.placed)
-        state = "已完成! 所有拼圖片都放好了" if placed == total and total > 0 and self._board_full() else \
-            f"{self.rows} x {self.cols} 盤面 | 已放置 {placed}/{total} 片"
+        state = "Solved! All pieces are placed." if placed == total and total > 0 and self._board_full() else \
+            f"{self.rows} x {self.cols} board | {placed}/{total} pieces placed"
         self.status_var.set(state)
-
-        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
 
     def _board_full(self) -> bool:
         return len(self.board) == self.rows * self.cols

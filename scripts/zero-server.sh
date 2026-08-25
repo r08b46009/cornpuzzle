@@ -133,11 +133,6 @@ new_configure_file=$(basename ${train_dir}).cfg
 
 ${sp_executable_file} -gen ${train_dir}/${new_configure_file} -conf_file ${configure_file} -conf_str "${overwrite_conf_str}" 2>/dev/null
 
-# Keep CornPuzzle folder-puzzle settings in generated training cfg.
-if [ "${game_type}" = "cornpuzzle" ]; then
-    grep -E "^env_compound_piece_library=|^env_compound_puzzles_dir=|^env_compound_random_select_puzzle=" "${configure_file}" >> "${train_dir}/${new_configure_file}"
-fi
-
 # Add CornPuzzle folder-puzzle settings into generated training cfg.
 append_cornpuzzle_cfg "${train_dir}/${new_configure_file}" "${configure_file}"
 
