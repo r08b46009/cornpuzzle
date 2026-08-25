@@ -48,6 +48,11 @@ const int kCornPuzzleShapeBoxCols = 4;
 
 const int kCornPuzzleDiscreteValueSize = 1;
 
+enum class CornActionPhase {
+    kSelectPiece,
+    kSelectPosition,
+};
+
 struct CornPlacement {
     int piece_id;
     int rotation;
@@ -131,7 +136,14 @@ public:
 
     void reset() override;
     void resetFromPuzzleFile(const std::string& puzzle_path);
+    bool resetFromCurriculumTask(const std::string& puzzle_path,
+                                 const std::string& solution_path,
+                                 int prefix_piece_count,
+                                 const std::string& task_id);
     inline std::string getPuzzlePath() const { return current_puzzle_path_; }
+    inline std::string getCurriculumTaskID() const { return curriculum_task_id_; }
+    inline std::string getCurriculumSolutionPath() const { return curriculum_solution_path_; }
+    inline int getCurriculumPrefix() const { return curriculum_prefix_piece_count_; }
 
     bool act(const CornPuzzleAction& action) override;
     bool act(const std::vector<std::string>& action_string_args) override
@@ -190,6 +202,7 @@ public:
     }
 
     std::string toString() const override;
+    std::string actionToConsoleString(const CornPuzzleAction& action) const;
     std::string name() const override { return kCornPuzzleName; }
     int getNumPlayer() const override { return kCornPuzzleNumPlayer; }
 
@@ -210,19 +223,52 @@ private:
 
     int activeArea() const;
     void applyCurriculumMask();
-    int firstEmptyPos() const;
-    bool resolveFirstEmptyPlacement(const CornPlacement& action_placement, CornPlacement& resolved) const;
+    bool applySolutionPrefix(const std::string& solution_path, int prefix_piece_count);
+    bool resolvePositionPlacement(const CornPlacement& action_placement,
+                                  int position,
+                                  CornPlacement& resolved) const;
     bool makeActionPlacement(int action_id, CornPlacement& placement) const;
+    bool candidateHasLegalFirstLayerPosition(const CornPlacement& placement) const;
+    bool candidateHasForcedRightPlacement(const CornPlacement& placement) const;
+    bool makePendingPlacement(CornPlacement& placement) const;
+
+    // Right-trim layer packing state.  The policy/action size stays identical
+    // to the original two-stage environment.  Only the first piece of the
+    // topmost unfinished row gets a free position choice.  Afterwards the
+    // next empty cell encountered while scanning right is the forced anchor.
+    bool isLayerRowFull(int row) const;
+    int findTopmostUnfinishedRow() const;
+    int getForcedLayerTargetPosition() const;
+    void initializeLayerStateFromBoard();
+    void updateLayerStateAfterPlacement(int placed_position, bool was_first_piece);
 
 private:
     std::array<int, kCornPuzzleBoardSize> board_;
     std::array<int, kCornPuzzleNumPieces> remaining_;
     std::array<int, kCornPuzzleNumPieces> initial_remaining_ = {};
     std::vector<CornCandidateShape> candidate_shapes_;
+    int raw_piece_count_ = 0;
 
     int active_rows_ = kCornPuzzlePlayableRows;
     int active_cols_ = kCornPuzzleCols;
     std::string current_puzzle_path_;
+    std::string curriculum_task_id_;
+    std::string curriculum_solution_path_;
+    int curriculum_prefix_piece_count_ = 0;
+
+    // A complete placement is represented by two consecutive actions while
+    // keeping the fixed 128-logit policy head:
+    //   SELECT_PIECE:    action = candidate_id * 2 + rotation_id
+    //   SELECT_POSITION: action = row * 14 + col (0..97)
+    CornActionPhase action_phase_ = CornActionPhase::kSelectPiece;
+    int pending_piece_id_ = -1;
+    int pending_rotation_ = 0;
+
+    // Layer packing mode (kept outside the policy head so pretrained
+    // two-stage weights remain shape-compatible).
+    int current_layer_row_ = 0;
+    bool first_piece_of_layer_ = true;
+    int layer_next_scan_col_ = 0;
 
     float reward_ = 0.0f;
     float total_reward_ = 0.0f;
@@ -235,6 +281,19 @@ public:
     {
         BaseEnvLoader<CornPuzzleAction, CornPuzzleEnv>::loadFromEnvironment(env, action_info_history);
         addTag("PUZZLE", env.getPuzzlePath());
+        if (!env.getCurriculumTaskID().empty()) {
+            addTag("CTASK", env.getCurriculumTaskID());
+            addTag("CSOLUTION", env.getCurriculumSolutionPath());
+            addTag("CPREFIX", std::to_string(env.getCurriculumPrefix()));
+        }
+    }
+
+    inline std::string getCurriculumTaskID() const { return getTag("CTASK"); }
+    inline std::string getCurriculumSolutionPath() const { return getTag("CSOLUTION"); }
+    inline int getCurriculumPrefix() const
+    {
+        const std::string value = getTag("CPREFIX");
+        return value.empty() ? 0 : std::stoi(value);
     }
 
     inline std::string getPuzzlePath() const
