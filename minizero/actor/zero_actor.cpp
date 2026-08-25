@@ -161,10 +161,15 @@ void ZeroActor::handleSearchDone()
     mcts_search_data_.selected_node_ = decideActionNode();
     const Action action = getSearchAction();
     std::ostringstream oss;
+#if CORNPUZZLE
+    const std::string action_string = env_.actionToConsoleString(action);
+#else
+    const std::string action_string = action.toConsoleString();
+#endif
     oss << "model file name: " << config::nn_file_name << std::endl
         << utils::TimeSystem::getTimeString("[Y/m/d H:i:s.f] ")
         << "move number: " << env_.getActionHistory().size()
-        << ", action: " << action.toConsoleString()
+        << ", action: " << action_string
         << " (" << action.getActionID() << ")"
         << ", reward: " << env_.getReward()
         << ", player: " << env::playerToChar(action.getPlayer());

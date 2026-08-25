@@ -5,6 +5,10 @@ namespace minizero::config {
 std::string env_compound_piece_library = "";
 std::string env_compound_puzzles_dir = "";
 bool env_compound_random_select_puzzle = false;
+bool env_cornpuzzle_curriculum_enable = false;
+std::string env_cornpuzzle_curriculum_tasks_file = "";
+bool env_cornpuzzle_curriculum_sequential = false;
+std::string env_cornpuzzle_curriculum_counter_file = "";
 
 // program parameters
 int program_seed = 0;
@@ -216,6 +220,22 @@ void setConfiguration(ConfigureLoader& cl)
     cl.addParameter("env_compound_random_select_puzzle",
                     env_compound_random_select_puzzle,
                     "true for randomly selecting a Compound puzzle at reset",
+                    "Environment");
+    cl.addParameter("env_cornpuzzle_curriculum_enable",
+                    env_cornpuzzle_curriculum_enable,
+                    "sample puzzle/solution/prefix tasks from the active Teacher manifest",
+                    "Environment");
+    cl.addParameter("env_cornpuzzle_curriculum_tasks_file",
+                    env_cornpuzzle_curriculum_tasks_file,
+                    "TSV manifest containing curriculum task types",
+                    "Environment");
+    cl.addParameter("env_cornpuzzle_curriculum_sequential",
+                    env_cornpuzzle_curriculum_sequential,
+                    "assign curriculum tasks sequentially across evaluation workers",
+                    "Environment");
+    cl.addParameter("env_cornpuzzle_curriculum_counter_file",
+                    env_cornpuzzle_curriculum_counter_file,
+                    "shared counter file used by sequential curriculum evaluation",
                     "Environment");
 #endif
 

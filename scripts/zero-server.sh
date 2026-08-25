@@ -108,8 +108,13 @@ fi
 
 run_stage="R"
 if [ -d ${train_dir} ]; then
+if [[ -n ${MINIZERO_RUN_STAGE:-} ]]; then
+run_stage=${MINIZERO_RUN_STAGE}
+echo "${train_dir} has existed. Automatic choice: ${run_stage}"
+else
 read -n1 -p "${train_dir} has existed. (R)estart / (C)ontinue / (Q)uit? " run_stage
 echo ""
+fi
 fi
 
 zero_start_iteration=1
@@ -133,7 +138,8 @@ new_configure_file=$(basename ${train_dir}).cfg
 
 ${sp_executable_file} -gen ${train_dir}/${new_configure_file} -conf_file ${configure_file} -conf_str "${overwrite_conf_str}" 2>/dev/null
 
-# Add CornPuzzle folder-puzzle settings into generated training cfg.
+# Add a setting only when the generated cfg does not already have it.
+# The old unconditional append duplicated these three CornPuzzle keys.
 append_cornpuzzle_cfg "${train_dir}/${new_configure_file}" "${configure_file}"
 
 # setup initial weight
@@ -151,7 +157,12 @@ echo y | ${sp_executable_file} -gen ${train_dir}/${new_configure_file} -conf_fil
 append_cornpuzzle_cfg "${train_dir}/${new_configure_file}" "${configure_file}"
 
 # friendly notification if continuing training
+if [[ -n ${MINIZERO_CONFIRM_CONTINUE:-} ]]; then
+yn=${MINIZERO_CONFIRM_CONTINUE}
+echo "Continue training from iteration: ${zero_start_iteration}, model file: ${model_file}, configuration: ${train_dir}/${new_configure_file}. Automatic confirmation: ${yn}"
+else
 read -n1 -p "Continue training from iteration: ${zero_start_iteration}, model file: ${model_file}, configuration: ${train_dir}/${new_configure_file}. Sure? (y/n) " yn
+fi
 [[ ${yn,,} == "y" ]] || exit
 echo ""
 else
@@ -166,7 +177,5 @@ conf_str="$conf_str:zero_num_games_per_iteration=0"
 fi
 
 ${sp_executable_file} -conf_file ${train_dir}/${new_configure_file} -conf_str ${conf_str} -mode zero_server
-
-
 
 

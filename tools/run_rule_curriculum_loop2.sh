@@ -1,0 +1,397 @@
+#!/bin/bash
+# Strict 100%-mastery backward curriculum. Safe to resume after interruption.
+set -Eeuo pipefail
+
+script_release="11"
+
+project_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${project_dir}"
+
+run_name="${RUN_NAME:-RuleCurriculum_seed0}"
+curriculum_dir="${CURRICULUM_DIR:-${project_dir}/curriculum_${run_name}}"
+plots_dir="${PLOTS_DIR:-${project_dir}/plots_${run_name}}"
+start_iteration="${START_ITERATION:-1}"
+end_iteration="${END_ITERATION:-200}"
+gpu="${GPU:-0123}"
+sp_gpu="${SP_GPU:-${gpu}}"
+op_gpu="${OP_GPU:-${gpu}}"
+eval_gpu="${EVAL_GPU:-${sp_gpu:0:1}}"
+sp_batch_size="${SP_BATCH_SIZE:-32}"
+port="${ZERO_SERVER_PORT:-22340}"
+base_config="${BASE_CONFIG:-configs/CL_new_wo_RT.cfg}"
+puzzles_dir="${PUZZLES_DIR:-${project_dir}/data/generated_wrap/puzzles/71424}"
+answers_dir="${ANSWERS_DIR:-${project_dir}/data/generated_wrap/answers}"
+training_games="${TRAINING_GAMES:-2000}"
+mastery_repeats="${MASTERY_REPEATS:-3}"
+testing_puzzles_dir="${TESTING_PUZZLES_DIR:-${project_dir}/validation}"
+run_full80_eval="${RUN_FULL80_EVAL:-1}"
+run_testing_eval="${RUN_TESTING_EVAL:-1}"
+mastery_patience="${MASTERY_PATIENCE:-2}"
+training_timeout="${TRAINING_TIMEOUT:-20m}"
+validation_timeout="${VALIDATION_TIMEOUT:-15m}"
+max_retries="${MAX_RETRIES:-3}"
+active_run_pid=""
+
+task_bank="${curriculum_dir}/task_bank.json"
+full80_manifest="${curriculum_dir}/full80_tasks.tsv"
+testing_manifest="${curriculum_dir}/testing20_tasks.tsv"
+state="${curriculum_dir}/rule_state.json"
+active_tasks="${curriculum_dir}/active_tasks.tsv"
+metrics_dir="${curriculum_dir}/metrics"
+full80_metrics_dir="${curriculum_dir}/full80_metrics"
+snapshots_dir="${curriculum_dir}/manifests"
+markers_dir="${curriculum_dir}/markers"
+master_log="${curriculum_dir}/rule_loop.log"
+
+mkdir -p "${metrics_dir}" "${full80_metrics_dir}" "${snapshots_dir}" "${markers_dir}" "${plots_dir}"
+exec > >(tee -a "${master_log}") 2>&1
+
+fail() { echo "[rule curriculum][ERROR] $*" >&2; exit 1; }
+step_for() { echo $(( $1 * 500 )); }
+manifest_task_count() { grep -vcE '^[[:space:]]*(#|$)' "$1"; }
+
+confirm_existing_run() {
+    local count answer root
+    local -a artifacts
+    artifacts=()
+
+    # Search the exact run directory first, then its evaluation directories.
+    # This avoids a compound find expression silently missing an existing run.
+    shopt -s nullglob
+    for root in \
+        "${project_dir}/${run_name}" \
+        "${project_dir}"/ValidationRule_"${run_name}"_iter* \
+        "${project_dir}"/Full80Rule_"${run_name}"_iter* \
+        "${project_dir}"/TestingRule_"${run_name}"_iter*; do
+        [[ -d "${root}" ]] || continue
+        while IFS= read -r item; do
+            artifacts+=("${item}")
+        done < <(find "${root}" -type f \
+            \( -name 'weight_iter_*.pt' -o -name 'weight_iter_*.pkl' -o -name '*.sgf' \) \
+            -printf '%T@ %p\n' 2>/dev/null)
+    done
+    shopt -u nullglob
+    if (( ${#artifacts[@]} > 0 )); then
+        mapfile -t artifacts < <(printf '%s\n' "${artifacts[@]}" | sort -n)
+    fi
+    count="${#artifacts[@]}"
+    (( count > 0 )) || return 0
+
+    echo "[rule curriculum][SAFETY] Existing training artifacts detected in: ${run_name}"
+    echo "[rule curriculum][SAFETY] Found ${count} weight/SGF files. Latest files:"
+    printf '%s\n' "${artifacts[@]}" | tail -8 | cut -d' ' -f2-
+    echo "[rule curriculum][SAFETY] Continuing may reuse this run's existing data."
+
+    if [[ -n "${RESUME_EXISTING:-}" ]]; then
+        answer="${RESUME_EXISTING}"
+        echo "[rule curriculum][SAFETY] RESUME_EXISTING supplied: ${answer}"
+    else
+        [[ -t 0 ]] || fail "existing artifacts require interactive confirmation; rerun in a terminal"
+        read -r -p "Continue/resume this existing experiment? Type y to continue [y/N]: " answer
+    fi
+    [[ "${answer,,}" == "y" ]] || fail "resume declined; no existing training data was changed"
+    echo "[rule curriculum][SAFETY] Resume explicitly confirmed."
+}
+
+# Every quick-run attempt is started in its own process group.  Always reap the
+# complete group so SP/OP workers cannot retain CUDA memory after success,
+# failure, timeout, Ctrl+C, or an outer-script error.
+cleanup_active_run() {
+    local pid="${active_run_pid:-}" signal
+    [[ -n "${pid}" ]] || return 0
+    if kill -0 -- "-${pid}" 2>/dev/null; then
+        for signal in INT TERM KILL; do
+            kill -"${signal}" -- "-${pid}" 2>/dev/null || true
+            for _ in {1..10}; do
+                kill -0 -- "-${pid}" 2>/dev/null || break 2
+                sleep 0.2
+            done
+        done
+    fi
+    wait "${pid}" 2>/dev/null || true
+    active_run_pid=""
+}
+trap 'exit 130' INT TERM
+trap cleanup_active_run EXIT
+
+run_with_retry() {
+    local label=$1 limit=$2 attempt status
+    shift 2
+    for ((attempt=1; attempt<=max_retries; attempt++)); do
+        echo "[rule curriculum] ${label}: attempt ${attempt}/${max_retries}"
+        set +e
+        setsid timeout --signal=INT --kill-after=30s "${limit}" "$@" &
+        active_run_pid=$!
+        wait "${active_run_pid}"
+        status=$?
+        cleanup_active_run
+        set -e
+        if (( status == 0 )); then return 0; fi
+        echo "[rule curriculum][WARN] ${label} failed/timed out (status=${status})"
+        sleep 15
+    done
+    fail "${label} failed after ${max_retries} attempts"
+}
+
+# Student training is deliberately NOT retried.  A retry would launch a new
+# self-play pass after a failed optimizer, making the data/checkpoint history
+# ambiguous.  Stop the complete curriculum immediately and leave a marker that
+# records the failed iteration for an explicit operator restart.
+run_training_failfast() {
+    local iteration=$1 limit=$2 failure_marker failed_dir failed_stamp failed_step status
+    shift 2
+    failure_marker="${markers_dir}/training_${iteration}_FAILED"
+    rm -f "${failure_marker}"
+    echo "[rule curriculum] training iteration ${iteration}: fail-fast attempt 1/1"
+    set +e
+    setsid timeout --signal=INT --kill-after=30s "${limit}" "$@" &
+    active_run_pid=$!
+    wait "${active_run_pid}"
+    status=$?
+    cleanup_active_run
+    set -e
+    if (( status != 0 )); then
+        failed_stamp="$(date +%Y%m%dT%H%M%S)"
+        failed_step="$(step_for "${iteration}")"
+        failed_dir="${markers_dir}/failed_attempts/iteration_${iteration}_${failed_stamp}"
+        mkdir -p "${failed_dir}"
+        # Preserve, but never reuse, data/checkpoints from an optimizer-failed
+        # attempt.  A manual restart therefore begins this iteration cleanly.
+        for artifact in \
+            "${run_name}/sgf/${iteration}.sgf" \
+            "${run_name}/model/weight_iter_${failed_step}.pt" \
+            "${run_name}/model/weight_iter_${failed_step}.pkl"; do
+            [[ -e "${artifact}" ]] && mv "${artifact}" "${failed_dir}/"
+        done
+        {
+            echo "timestamp=$(date -Iseconds)"
+            echo "iteration=${iteration}"
+            echo "status=${status}"
+            echo "reason=student training or optimization failed; no automatic self-play retry"
+            echo "quarantine=${failed_dir}"
+        } > "${failure_marker}"
+        fail "training iteration ${iteration} failed/timed out (status=${status}); curriculum stopped"
+    fi
+}
+
+[[ -f "${base_config}" ]] || fail "missing config: ${base_config}"
+[[ -d "${puzzles_dir}" ]] || fail "missing puzzles: ${puzzles_dir}"
+[[ -d "${answers_dir}" ]] || fail "missing answers: ${answers_dir}"
+[[ -d "${testing_puzzles_dir}" ]] || fail "missing held-out testing puzzles: ${testing_puzzles_dir}"
+(( mastery_patience >= 1 )) || fail "MASTERY_PATIENCE must be >= 1"
+(( mastery_repeats >= 1 )) || fail "MASTERY_REPEATS must be >= 1"
+
+echo "[rule curriculum] script release v${script_release}"
+echo "[rule curriculum] project: ${project_dir}"
+echo "[rule curriculum] run: ${run_name}"
+
+# Ask exactly once at startup. The inner zero-server confirmation remains
+# automatic only after this explicit outer approval, so a multi-iteration run
+# can continue unattended without silently accepting a pre-existing run.
+confirm_existing_run
+
+if [[ ! -f "${task_bank}" ]]; then
+    python3 tools/curriculum_teacher.py build \
+        --puzzles "${puzzles_dir}" --answers "${answers_dir}" \
+        --output "${task_bank}" --expected-puzzles 80
+fi
+if [[ ! -f "${full80_manifest}" ]]; then
+    python3 tools/rule_curriculum.py write-level-manifest \
+        --task-bank "${task_bank}" --level full --output "${full80_manifest}"
+fi
+if [[ ! -f "${testing_manifest}" ]]; then
+    python3 tools/rule_curriculum.py write-folder-manifest \
+        --folder "${testing_puzzles_dir}" --expected 20 --output "${testing_manifest}"
+fi
+python3 tools/rule_curriculum.py status --state "${state}"
+
+# Create a brand-new random Student checkpoint. Reusing RUN_NAME resumes it;
+# choosing a new RUN_NAME guarantees that an older experiment is untouched.
+if [[ ! -d "${run_name}" ]]; then
+    echo "[rule curriculum] creating fresh Student: ${run_name}"
+    MINIZERO_RUN_STAGE=R tools/quick-run.sh train cornpuzzle "${base_config}" 0 \
+        -n "${run_name}" --sp_gpu "${sp_gpu}" --op_gpu "${op_gpu}" -b "${sp_batch_size}" -p "${port}" \
+        -conf_str "program_seed=0:program_auto_seed=false:actor_num_simulation=50:env_compound_puzzles_dir=${puzzles_dir}" || true
+fi
+[[ -f "${run_name}/model/weight_iter_0.pt" ]] || fail "weight_iter_0.pt was not created"
+
+run_validation() {
+    local iteration=$1 manifest=$2 step vname metrics sgf validation_port task_count validation_games counter
+    step=$(step_for "${iteration}")
+    vname="ValidationRule_${run_name}_iter${iteration}"
+    metrics="${metrics_dir}/after_iter${iteration}.json"
+    sgf="${vname}/sgf/1.sgf"
+    validation_port=$((port + 1))
+    task_count=$(manifest_task_count "${manifest}")
+    validation_games=$((task_count * mastery_repeats))
+    counter="${curriculum_dir}/counters/validation_iter${iteration}.counter"
+    mkdir -p "$(dirname "${counter}")"
+    echo 0 > "${counter}"
+    echo "[rule curriculum] mastery evaluation: ${task_count} tasks x ${mastery_repeats} = ${validation_games} games"
+
+    if [[ -f "${metrics}" && -f "${markers_dir}/validation_${iteration}_complete" ]]; then
+        echo "[rule curriculum] validation iteration ${iteration} already complete"
+        return
+    fi
+    [[ -f "${run_name}/model/weight_iter_${step}.pt" ]] || fail "missing weight_iter_${step}.pt"
+    [[ -f "${run_name}/model/weight_iter_${step}.pkl" ]] || fail "missing weight_iter_${step}.pkl"
+
+    mkdir -p "${vname}/model" "${vname}/sgf"
+    cp "${run_name}/${run_name}.cfg" "${vname}/${vname}.cfg"
+    cp "${run_name}/model/weight_iter_${step}.pt" "${vname}/model/"
+    cp "${run_name}/model/weight_iter_${step}.pkl" "${vname}/model/"
+    touch "${vname}/op.log"
+
+    run_with_retry "validation iteration ${iteration}" "${validation_timeout}" \
+      env MINIZERO_RUN_STAGE=C MINIZERO_CONFIRM_CONTINUE=y \
+      tools/quick-run.sh train cornpuzzle "${vname}/${vname}.cfg" 1 \
+        -n "${vname}" --sp_gpu "${eval_gpu}" --op_gpu "${op_gpu}" -b "${sp_batch_size}" -p "${validation_port}" --sp_progress \
+        -conf_str "actor_num_simulation=50:actor_select_action_by_count=true:actor_select_action_by_softmax_count=false:actor_use_dirichlet_noise=false:actor_use_gumbel_noise=false:zero_num_threads=1:zero_num_parallel_games=1:env_cornpuzzle_curriculum_enable=true:env_cornpuzzle_curriculum_tasks_file=${manifest}:env_cornpuzzle_curriculum_sequential=true:env_cornpuzzle_curriculum_counter_file=${counter}:env_compound_puzzles_dir=${puzzles_dir}:zero_num_games_per_iteration=${validation_games}:learner_training_step=0"
+
+    [[ -f "${sgf}" ]] || fail "validation SGF missing: ${sgf}"
+    python3 tools/rule_curriculum_metrics.py \
+        --sgf "${sgf}" --manifest "${manifest}" \
+        --training-log "${run_name}/Training.log" --op-log "${run_name}/op.log" \
+        --iteration "${iteration}" --output "${metrics}"
+    touch "${markers_dir}/validation_${iteration}_complete"
+}
+
+run_full80() {
+    local iteration=$1 step fname metrics sgf full80_port full80_games counter
+    step=$(step_for "${iteration}")
+    fname="Full80Rule_${run_name}_iter${iteration}"
+    metrics="${full80_metrics_dir}/after_iter${iteration}.json"
+    sgf="${fname}/sgf/1.sgf"
+    full80_port=$((port + 2))
+    full80_games=$(manifest_task_count "${full80_manifest}")
+    counter="${curriculum_dir}/counters/full80_iter${iteration}.counter"
+    mkdir -p "$(dirname "${counter}")"
+    echo 0 > "${counter}"
+
+    if [[ -f "${metrics}" && -f "${markers_dir}/full80_${iteration}_complete" ]]; then
+        echo "[rule curriculum] in-domain Full-80 iteration ${iteration} already complete"
+        return
+    fi
+    [[ -f "${run_name}/model/weight_iter_${step}.pt" ]] || fail "missing weight_iter_${step}.pt"
+    [[ -f "${run_name}/model/weight_iter_${step}.pkl" ]] || fail "missing weight_iter_${step}.pkl"
+
+    mkdir -p "${fname}/model" "${fname}/sgf"
+    cp "${run_name}/${run_name}.cfg" "${fname}/${fname}.cfg"
+    cp "${run_name}/model/weight_iter_${step}.pt" "${fname}/model/"
+    cp "${run_name}/model/weight_iter_${step}.pkl" "${fname}/model/"
+    touch "${fname}/op.log"
+
+    run_with_retry "in-domain Full-80 iteration ${iteration}" "${validation_timeout}" \
+      env MINIZERO_RUN_STAGE=C MINIZERO_CONFIRM_CONTINUE=y \
+      tools/quick-run.sh train cornpuzzle "${fname}/${fname}.cfg" 1 \
+        -n "${fname}" --sp_gpu "${eval_gpu}" --op_gpu "${op_gpu}" -b "${sp_batch_size}" -p "${full80_port}" --sp_progress \
+        -conf_str "actor_num_simulation=50:actor_select_action_by_count=true:actor_select_action_by_softmax_count=false:actor_use_dirichlet_noise=false:actor_use_gumbel_noise=false:zero_num_threads=1:zero_num_parallel_games=1:env_cornpuzzle_curriculum_enable=true:env_cornpuzzle_curriculum_tasks_file=${full80_manifest}:env_cornpuzzle_curriculum_sequential=true:env_cornpuzzle_curriculum_counter_file=${counter}:env_compound_puzzles_dir=${puzzles_dir}:zero_num_games_per_iteration=${full80_games}:learner_training_step=0"
+
+    [[ -f "${sgf}" ]] || fail "Full-80 SGF missing: ${sgf}"
+    python3 tools/rule_curriculum_metrics.py \
+        --sgf "${sgf}" --manifest "${full80_manifest}" \
+        --training-log "${run_name}/Training.log" --op-log "${run_name}/op.log" \
+        --iteration "${iteration}" --output "${metrics}"
+    touch "${markers_dir}/full80_${iteration}_complete"
+}
+
+run_testing() {
+    local iteration=$1 step tname sgf testing_port testing_games counter
+    step=$(step_for "${iteration}")
+    tname="TestingRule_${run_name}_iter${iteration}"
+    sgf="${tname}/sgf/1.sgf"
+    testing_port=$((port + 3))
+    testing_games=$(manifest_task_count "${testing_manifest}")
+    counter="${curriculum_dir}/counters/testing_iter${iteration}.counter"
+    mkdir -p "$(dirname "${counter}")"
+    echo 0 > "${counter}"
+
+    if [[ -f "${sgf}" && -f "${markers_dir}/testing_${iteration}_complete" ]]; then
+        echo "[rule curriculum] held-out testing iteration ${iteration} already complete"
+        return
+    fi
+    mkdir -p "${tname}/model" "${tname}/sgf"
+    cp "${run_name}/${run_name}.cfg" "${tname}/${tname}.cfg"
+    cp "${run_name}/model/weight_iter_${step}.pt" "${tname}/model/"
+    cp "${run_name}/model/weight_iter_${step}.pkl" "${tname}/model/"
+    touch "${tname}/op.log"
+
+    run_with_retry "held-out testing iteration ${iteration}" "${validation_timeout}" \
+      env MINIZERO_RUN_STAGE=C MINIZERO_CONFIRM_CONTINUE=y \
+      tools/quick-run.sh train cornpuzzle "${tname}/${tname}.cfg" 1 \
+        -n "${tname}" --sp_gpu "${eval_gpu}" --op_gpu "${op_gpu}" -b "${sp_batch_size}" -p "${testing_port}" --sp_progress \
+        -conf_str "actor_num_simulation=50:actor_select_action_by_count=true:actor_select_action_by_softmax_count=false:actor_use_dirichlet_noise=false:actor_use_gumbel_noise=false:zero_num_threads=1:zero_num_parallel_games=1:env_cornpuzzle_curriculum_enable=true:env_cornpuzzle_curriculum_tasks_file=${testing_manifest}:env_cornpuzzle_curriculum_sequential=true:env_cornpuzzle_curriculum_counter_file=${counter}:env_compound_puzzles_dir=${testing_puzzles_dir}:zero_num_games_per_iteration=${testing_games}:learner_training_step=0"
+    [[ -f "${sgf}" ]] || fail "testing SGF missing: ${sgf}"
+    touch "${markers_dir}/testing_${iteration}_complete"
+}
+
+if (( start_iteration < 1 || start_iteration > end_iteration )); then
+    fail "START_ITERATION must be between 1 and END_ITERATION"
+fi
+
+for ((iteration=start_iteration; iteration<=end_iteration; iteration++)); do
+    if [[ "$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("complete", False)))' "${state}")" == 1 ]]; then
+        echo "[rule curriculum] curriculum already complete; stop"
+        break
+    fi
+
+    manifest="${snapshots_dir}/iter${iteration}_tasks.tsv"
+    if [[ ! -f "${manifest}" ]]; then
+        python3 tools/rule_curriculum.py write-manifest \
+            --task-bank "${task_bank}" --state "${state}" --output "${manifest}"
+    fi
+    cp "${manifest}" "${active_tasks}"
+    step=$(step_for "${iteration}")
+    echo "[rule curriculum] ===== iteration ${iteration}/${end_iteration}; NN step ${step} ====="
+
+    if [[ ! -f "${run_name}/model/weight_iter_${step}.pt" ]]; then
+        run_training_failfast "${iteration}" "${training_timeout}" \
+          env MINIZERO_RUN_STAGE=C MINIZERO_CONFIRM_CONTINUE=y \
+          tools/quick-run.sh train cornpuzzle "${base_config}" "${iteration}" \
+            -n "${run_name}" --sp_gpu "${sp_gpu}" --op_gpu "${op_gpu}" -b "${sp_batch_size}" -p "${port}" --sp_progress \
+            -conf_str "program_seed=0:program_auto_seed=false:actor_num_simulation=50:zero_num_games_per_iteration=${training_games}:zero_replay_buffer=4:env_cornpuzzle_curriculum_enable=true:env_cornpuzzle_curriculum_tasks_file=${active_tasks}:env_compound_puzzles_dir=${puzzles_dir}"
+    else
+        echo "[rule curriculum] weight_iter_${step}.pt exists; skip training"
+    fi
+
+    # quick-run returning zero is necessary but not sufficient: never evaluate
+    # or advance unless both checkpoint formats for this exact step exist.
+    [[ -f "${run_name}/model/weight_iter_${step}.pt" ]] || \
+        fail "training iteration ${iteration} returned without weight_iter_${step}.pt"
+    [[ -f "${run_name}/model/weight_iter_${step}.pkl" ]] || \
+        fail "training iteration ${iteration} returned without weight_iter_${step}.pkl"
+    rm -f "${markers_dir}/training_${iteration}_FAILED"
+    touch "${markers_dir}/training_${iteration}_complete"
+
+    run_validation "${iteration}" "${manifest}"
+
+    if [[ "${run_full80_eval}" == "1" ]]; then
+        run_full80 "${iteration}"
+    else
+        echo "[rule curriculum] Full80 evaluation disabled (RUN_FULL80_EVAL=${run_full80_eval})"
+    fi
+
+    if [[ "${run_testing_eval}" == "1" ]]; then
+        run_testing "${iteration}"
+    else
+        echo "[rule curriculum] testing evaluation disabled (RUN_TESTING_EVAL=${run_testing_eval})"
+    fi
+
+    if [[ ! -f "${markers_dir}/state_${iteration}_updated" ]]; then
+        python3 tools/rule_curriculum.py update \
+            --state "${state}" --metrics "${metrics_dir}/after_iter${iteration}.json" \
+            --iteration "${iteration}" --patience "${mastery_patience}"
+        touch "${markers_dir}/state_${iteration}_updated"
+    fi
+
+    # Recreate every curve after every training/validation round. Stage changes
+    # are drawn as shaded regions and dashed vertical boundaries.
+    python3 tools/plot_rule_curriculum.py \
+        --run-dir "${run_name}" --curriculum-dir "${curriculum_dir}" \
+        --output-dir "${plots_dir}" --testing-root "${project_dir}" \
+        --full80-metrics-dir "${full80_metrics_dir}"
+done
+
+python3 tools/rule_curriculum.py status --state "${state}"
+echo "[rule curriculum] plots: ${plots_dir}"
+echo "[rule curriculum] latest checkpoints: ${run_name}/model/"

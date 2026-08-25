@@ -1,0 +1,93 @@
+[
+  {
+    "level": "remain2",
+    "curriculum_iteration": 7,
+    "training_step": 3500,
+    "weight": "0816_plateau_aug/model/weight_iter_3500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain2+remain4",
+    "curriculum_iteration": 16,
+    "training_step": 8000,
+    "weight": "0816_plateau_aug/model/weight_iter_8000.pt",
+    "exists": true
+  },
+  {
+    "level": "remain4+remain6",
+    "curriculum_iteration": 26,
+    "training_step": 13000,
+    "weight": "0816_plateau_aug/model/weight_iter_13000.pt",
+    "exists": true
+  },
+  {
+    "level": "remain6+remain8",
+    "curriculum_iteration": 45,
+    "training_step": 22500,
+    "weight": "0816_plateau_aug/model/weight_iter_22500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain8+remain10",
+    "curriculum_iteration": 67,
+    "training_step": 33500,
+    "weight": "0816_plateau_aug/model/weight_iter_33500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain10+remain12",
+    "curriculum_iteration": 85,
+    "training_step": 42500,
+    "weight": "0816_plateau_aug/model/weight_iter_42500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain12+remain14",
+    "curriculum_iteration": 97,
+    "training_step": 48500,
+    "weight": "0816_plateau_aug/model/weight_iter_48500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain14+remain16",
+    "curriculum_iteration": 145,
+    "training_step": 72500,
+    "weight": "0816_plateau_aug/model/weight_iter_72500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain16+remain18",
+    "curriculum_iteration": 164,
+    "training_step": 82000,
+    "weight": "0816_plateau_aug/model/weight_iter_82000.pt",
+    "exists": true
+  },
+  {
+    "level": "remain18+remain20",
+    "curriculum_iteration": 179,
+    "training_step": 89500,
+    "weight": "0816_plateau_aug/model/weight_iter_89500.pt",
+    "exists": true
+  },
+  {
+    "level": "remain20+remain22",
+    "curriculum_iteration": 194,
+    "training_step": 97000,
+    "weight": "0816_plateau_aug/model/weight_iter_97000.pt",
+    "exists": true
+  },
+  {
+    "level": "remain22+full",
+    "curriculum_iteration": 209,
+    "training_step": 104500,
+    "weight": "0816_plateau_aug/model/weight_iter_104500.pt",
+    "exists": true
+  },
+  {
+    "level": "full",
+    "curriculum_iteration": 224,
+    "training_step": 112000,
+    "weight": "0816_plateau_aug/model/weight_iter_112000.pt",
+    "exists": true
+  }
+]

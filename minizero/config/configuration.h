@@ -7,6 +7,10 @@ namespace minizero::config {
 extern std::string env_compound_puzzles_dir;
 extern bool env_compound_random_select_puzzle;
 extern std::string env_compound_piece_library;
+extern bool env_cornpuzzle_curriculum_enable;
+extern std::string env_cornpuzzle_curriculum_tasks_file;
+extern bool env_cornpuzzle_curriculum_sequential;
+extern std::string env_cornpuzzle_curriculum_counter_file;
 // program parameters
 extern int program_seed;
 extern bool program_auto_seed;
