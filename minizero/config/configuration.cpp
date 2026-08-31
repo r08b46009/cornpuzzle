@@ -9,6 +9,7 @@ bool env_cornpuzzle_curriculum_enable = false;
 std::string env_cornpuzzle_curriculum_tasks_file = "";
 bool env_cornpuzzle_curriculum_sequential = false;
 std::string env_cornpuzzle_curriculum_counter_file = "";
+std::string test_output_path = "";
 
 // program parameters
 int program_seed = 0;
@@ -236,6 +237,10 @@ void setConfiguration(ConfigureLoader& cl)
     cl.addParameter("env_cornpuzzle_curriculum_counter_file",
                     env_cornpuzzle_curriculum_counter_file,
                     "shared counter file used by sequential curriculum evaluation",
+                    "Environment");
+    cl.addParameter("test_output_path",
+                    test_output_path,
+                    "directory for test/evaluation outputs",
                     "Environment");
 #endif
 

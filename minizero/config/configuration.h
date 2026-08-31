@@ -11,6 +11,7 @@ extern bool env_cornpuzzle_curriculum_enable;
 extern std::string env_cornpuzzle_curriculum_tasks_file;
 extern bool env_cornpuzzle_curriculum_sequential;
 extern std::string env_cornpuzzle_curriculum_counter_file;
+extern std::string test_output_path;
 // program parameters
 extern int program_seed;
 extern bool program_auto_seed;

@@ -8,10 +8,126 @@ scripts/zero-server.sh cornpuzzle CL_new_wo.cfg 200 -n CL_new_wo_gumx_1
 ## Demo
 
 <p align="center">
-  <img src="cornpuzzle_56_ece_terminal_color.gif" width="900">
+  <img src="docs/imgs/cornpuzzle_56_ece_terminal_color.gif" width="900">
 </p>
 
-## Run Tranformer blocks
+## Train Curriculum Learning
+
+Run curriculum learning with the rule-based curriculum driver.
+
+Usage:
+```bash
+BASE_CONFIG=[BASE CONFIG FILE PATH] \
+RUN_NAME=[RUN OUTPUT DIR NAME] \
+START_ITERATION=[START ITERATION] \
+END_ITERATION=[END ITERATION] \
+TESTING_PUZZLES_DIR=[TESTING PUZZLES DIR PATH] \
+HELDOUT_ANSWERS_DIR=[HELDOUT ANSWERS DIR PATH] \
+PLATEAU_WINDOW=[PLATEAU WINDOW] \
+PLATEAU_SLOPE=[PLATEAU SLOPE] \
+PLATEAU_MIN_ITERATIONS=[PLATEAU MIN ITERATIONS] \
+MASTERY_REPEATS=[MASTERY REPEATS] \
+RUN_FULL80_EVAL=[true|false] \
+RUN_TESTING_EVAL=[true|false] \
+TRAINING_TIMEOUT=[TIMEOUT] \
+SP_GPU=[SELF-PLAY GPU ID] \
+OP_GPU=[OPTIMIZATION GPU ID] \
+SP_BATCH_SIZE=[SELF-PLAY BATCH SIZE] \
+ZERO_SERVER_PORT=[ZERO SERVER PORT] \
+tools/run_rule_curriculum_loop.sh
+```
+
+Example:
+```
+BASE_CONFIG=/workspace/configs/CL_new_wo_RT.cfg \
+RUN_NAME=0816_plateau_au_2 \
+START_ITERATION=8 \
+END_ITERATION=1500 \
+TESTING_PUZZLES_DIR=/workspace/testing2/puzzles/71424 \
+HELDOUT_ANSWERS_DIR=/workspace/testing2/answers \
+PLATEAU_WINDOW=5 \
+PLATEAU_SLOPE=0.001 \
+PLATEAU_MIN_ITERATIONS=5 \
+MASTERY_REPEATS=3 \
+RUN_FULL80_EVAL=false \
+RUN_TESTING_EVAL=false \
+TRAINING_TIMEOUT=48h \
+SP_GPU=0 \
+OP_GPU=0 \
+SP_BATCH_SIZE=32 \
+ZERO_SERVER_PORT=23483 \
+tools/run_rule_curriculum_loop.sh
+```
+
+The driver resumes from `START_ITERATION`, writes checkpoints and logs under `RUN_NAME`, and advances the curriculum according to the plateau and mastery settings.
+
+## Run Evaluation
+
+```bash
+./scripts/start-container.sh
+tools/run_cornpuzzle_eval_plot.sh \
+  [CONFIG FILE PATH] \
+  ["CONFIG FILE STR"] \
+  [MODEL PT FILE PATH] \
+  [EVAL PUZZLES DIR PATH] \
+  [EVAL RESULT OUTPUT PATH]
+```
+
+Example:
+```bash
+./scripts/start-container.sh
+tools/run_cornpuzzle_eval_plot.sh \
+  0816_plateau_au_2/0816_plateau_au_2.cfg \
+  0816_plateau_au_2/model/weight_iter_90000.pt \
+  data/generated_wrap/puzzles/71424 \
+  solve_outputs/run_001
+```
+
+**[RECOMMEND] Example with optional config overrides:**
+```bash
+./scripts/start-container.sh
+tools/run_cornpuzzle_eval_plot.sh \
+  0816_plateau_au_2/0816_plateau_au_2.cfg \
+  "actor_num_simulation=400:actor_select_action_by_count=true:actor_select_action_by_softmax_count=false:actor_use_gumbel=false:actor_use_dirichlet_noise=false:actor_use_random_rotation_features=false:actor_resign_threshold=-1.0" \
+  0816_plateau_au_2/model/weight_iter_90000.pt \
+  data/generated_wrap/puzzles/71424 \
+  solve_outputs/run_001
+```
+
+Run the command above to execute evaluation and result visualization in a single workflow.
+The wrapper also writes the final merged evaluation config to `[EVAL RESULT OUTPUT PATH]/eval_config.cfg`.
+To run evaluation and plotting separately, follow the two steps below.
+
+### [Part 1] Run MiniZero Evaluation Tool
+```bash
+./build/cornpuzzle/minizero_cornpuzzle \
+  -mode solve_cornpuzzle \
+  -conf_file [CONFIG FILE PATH] \
+  -conf_str "nn_file_name=[MODEL PT FILE PATH]:env_compound_puzzles_dir=[EVAL PUZZLES DIR PATH]:test_output_path=[EVAL RESULT OUTPUT PATH]"
+```
+
+Example:
+```bash
+./build/cornpuzzle/minizero_cornpuzzle \
+  -mode solve_cornpuzzle \
+  -conf_file 0816_plateau_au_2/0816_plateau_au_2.cfg \
+  -conf_str "nn_file_name=0816_plateau_au_2/model/weight_iter_90000.pt:env_compound_puzzles_dir=data/generated_wrap/puzzles/71424:test_output_path=solve_outputs/run_001"
+```
+
+### [Part 2] Run Plot Tool
+
+```bash
+./scripts/start-container.sh
+python3 tools/solve_stdout_to_html.py [EVAL RESULT OUTPUT PATH]/stdout
+```
+
+Example:
+```bash
+./scripts/start-container.sh
+python3 tools/solve_stdout_to_html.py solve_outputs/run_001/stdout
+```
+
+## Run Transformer Blocks
 
 ```
 bash scripts/start-container.sh

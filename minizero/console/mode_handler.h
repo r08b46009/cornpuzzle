@@ -49,6 +49,7 @@ protected:
     virtual void runEnvTest();
     virtual void runRemoveObs();
     virtual void runRecoverObs();
+    virtual void runSolveCornPuzzle();
 
     std::map<std::string, std::shared_ptr<BaseFunction>> function_map_;
 };
